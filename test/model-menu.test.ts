@@ -34,15 +34,24 @@ function harness() {
   const bot = new Bot("1:fake", { botInfo: { id: 1, is_bot: true, first_name: "bot", username: "manglr" } as any });
   bot.api.config.use(async (_prev, method, payload) => {
     calls.push({ method, payload: payload as Record<string, any> });
-    const result = method === "sendMessage" ? { message_id: 100 + calls.length, chat: CHAT, date: 0 } : true;
+    const result =
+      method === "sendMessage"
+        ? { message_id: 100 + calls.length, chat: CHAT, date: 0 }
+        : method === "createForumTopic"
+          ? { message_thread_id: TOPIC + 1, name: "t", icon_color: 0 }
+          : true;
     return { ok: true, result } as any;
   });
 
   const store = new SessionStore(mkdtempSync(path.join(tmpdir(), "manglr-test-")));
   store.upsert({ topicId: TOPIC, agent: "claude", project: "p", cwd: "/tmp", title: "t" });
   const switched: (string | undefined)[] = [];
+  const started: string[] = [];
   const manager = {
     isBusy: () => false,
+    create: (topicId: number, agent: "claude" | "codex", project: { name: string; path: string }, title: string, autoTitle: boolean) =>
+      store.upsert({ topicId, agent, project: project.name, cwd: project.path, title, autoTitle }),
+    send: (_topicId: number, text: string) => void started.push(text),
     setModel: async (topicId: number, model: string | undefined) => {
       switched.push(model);
       store.update(topicId, { model });
@@ -50,6 +59,7 @@ function harness() {
   } as unknown as SessionManager;
   const models = {
     list: async () => CLAUDE_MODELS,
+    defaultName: async () => CLAUDE_MODELS[0]!.description,
     label: async (_a: string, v: string | undefined) => {
       const m = CLAUDE_MODELS.find((x) => x.value === (v ?? ""))!;
       return v ? m.label : `${m.label} (${m.description})`;
@@ -79,7 +89,7 @@ function harness() {
         ...(text.startsWith("/") ? { entities: [{ type: "bot_command", offset: 0, length: text.split(" ")[0]!.length }] } : {}),
       },
     } as Update);
-  const tap = (data: string) =>
+  const tap = (data: string, messageId = 99) =>
     bot.handleUpdate({
       update_id: ++updateId,
       callback_query: {
@@ -87,10 +97,10 @@ function harness() {
         from: USER,
         chat_instance: "x",
         data,
-        message: { message_id: 99, date: 0, chat: CHAT, text: "menu", message_thread_id: TOPIC, is_topic_message: true },
+        message: { message_id: messageId, date: 0, chat: CHAT, text: "menu", message_thread_id: TOPIC, is_topic_message: true },
       },
     } as Update);
-  return { bot, calls, store, switched, send, tap };
+  return { bot, calls, store, switched, started, send, tap };
 }
 
 const buttons = (call: Call): { text: string; callback_data: string }[] => call.payload.reply_markup.inline_keyboard.flat();
@@ -160,4 +170,18 @@ test("ended sessions refuse model changes", async () => {
   await h.tap("mdl:s:haiku");
   assert.equal(last(h.calls, "answerCallbackQuery").payload.text, "This session has ended.");
   assert.deepEqual(h.switched, []);
+});
+
+test("a new thread starts on the host's default model without asking", async () => {
+  const h = harness();
+  await h.bot.init();
+  await h.send("/new fix the tests", null);
+  const menu = last(h.calls, "sendMessage");
+  await h.tap("new:a:claude", 100 + h.calls.indexOf(menu) + 1);
+  const welcome = last(h.calls, "sendMessage");
+  assert.equal(welcome.payload.message_thread_id, TOPIC + 1);
+  assert.match(welcome.payload.text, /🧠 Opus 5\.5 <i>\(default, \/model to switch\)<\/i>/);
+  assert.equal(welcome.payload.reply_markup, undefined);
+  assert.equal(h.store.get(TOPIC + 1)!.model, undefined);
+  assert.deepEqual(h.started, ["fix the tests"]);
 });
