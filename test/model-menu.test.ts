@@ -11,6 +11,7 @@ import type { SessionManager } from "../src/sessions.js";
 import { SessionStore } from "../src/store.js";
 import { registerHandlers } from "../src/telegram/bot.js";
 import type { PermissionBroker } from "../src/telegram/permissions.js";
+import type { HostDirectory } from "../src/remote/registry.js";
 
 const CHAT = { id: -1001234567890, type: "supergroup" as const, title: "agents", is_forum: true as const };
 const USER = { id: 42, is_bot: false, first_name: "me" };
@@ -30,7 +31,7 @@ interface Call {
 }
 
 /** The real handlers on a bot whose API calls are recorded instead of sent. */
-function harness() {
+function harness(hosts?: HostDirectory) {
   const calls: Call[] = [];
   const bot = new Bot("1:fake", { botInfo: { id: 1, is_bot: true, first_name: "bot", username: "manglr" } as any });
   bot.api.config.use(async (_prev, method, payload) => {
@@ -51,8 +52,8 @@ function harness() {
   const started: string[] = [];
   const manager = {
     isBusy: () => false,
-    create: (topicId: number, agent: "claude" | "codex", project: { name: string; path: string }, title: string, autoTitle: boolean) =>
-      store.upsert({ topicId, agent, project: project.name, cwd: project.path, title, autoTitle }),
+    create: (topicId: number, agent: "claude" | "codex", project: { name: string; path: string }, title: string, autoTitle: boolean, host?: string) =>
+      store.upsert({ topicId, agent, host, project: project.name, cwd: project.path, title, autoTitle }),
     send: (_topicId: number, text: string) => void started.push(text),
     setModel: async (topicId: number, model: string | undefined) => {
       switched.push(model);
@@ -74,7 +75,7 @@ function harness() {
   // The real catalog, with the list Claude Code would report.
   const models = new ModelCatalog(cfg);
   models.list = async () => CLAUDE_MODELS;
-  registerHandlers(bot, cfg, store, manager, {} as PermissionBroker, models);
+  registerHandlers(bot, cfg, store, manager, {} as PermissionBroker, models, hosts);
 
   let updateId = 0;
   const send = (text: string, topic: number | null = TOPIC) =>
@@ -267,4 +268,43 @@ test("ended sessions refuse effort changes", async () => {
   await h.tap("eff:s:low");
   assert.equal(last(h.calls, "answerCallbackQuery").payload.text, "This session has ended.");
   assert.deepEqual(h.efforts, []);
+});
+
+test("with remote hosts, /new asks for the computer first and the thread runs there", async () => {
+  const remote = new ModelCatalog({ workdir: { path: "~" }, claude: {}, codex: {} });
+  remote.list = async () => [{ value: "", label: "Default", description: "Sonnet 5.5", efforts: [] }];
+  const hosts: HostDirectory = {
+    names: () => ["bazzite", "debian"],
+    config: (name) => ({ name, ssh: name, cwd: "~/Code", command: "runner" }),
+    catalog: () => remote,
+  };
+  const h = harness(hosts);
+  await h.bot.init();
+  await h.send("/new fix the tests", null);
+  const menu = last(h.calls, "sendMessage");
+  assert.match(menu.payload.text, /Which computer\?/);
+  const picks = buttons(menu).map((b) => b.callback_data);
+  assert.deepEqual(picks.slice(1), ["new:h:bazzite", "new:h:debian", "new:x"]);
+  assert.equal(picks[0], "new:h:", "this host comes first");
+
+  const menuId = 100 + h.calls.indexOf(menu) + 1;
+  await h.tap("new:h:nope", menuId);
+  assert.equal(last(h.calls, "answerCallbackQuery").payload.text, "Unknown choice.");
+  await h.tap("new:h:bazzite", menuId);
+  const agentMenu = last(h.calls, "editMessageText");
+  assert.match(agentMenu.payload.text, /on <b>bazzite<\/b>\. Which agent\?/);
+  assert.deepEqual(buttons(agentMenu).map((b) => b.callback_data), ["new:a:claude", "new:a:codex", "new:x"]);
+
+  await h.tap("new:a:claude", menuId);
+  assert.equal(last(h.calls, "createForumTopic").payload.name, "🟠 bazzite: fix the tests");
+  const rec = h.store.get(TOPIC + 1)!;
+  assert.equal(rec.host, "bazzite");
+  assert.equal(rec.cwd, "~/Code");
+  const welcome = last(h.calls, "sendMessage");
+  assert.match(welcome.payload.text, /on <b>bazzite<\/b> in <code>~\/Code<\/code>/);
+  assert.match(welcome.payload.text, /🧠 Sonnet 5\.5/, "the remote host's default model");
+  assert.deepEqual(h.started, ["fix the tests"]);
+
+  await h.send("/status", TOPIC + 1);
+  assert.match(last(h.calls, "sendMessage").payload.text, /host: bazzite/);
 });

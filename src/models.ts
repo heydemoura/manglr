@@ -3,7 +3,8 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { query, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { AgentKind } from "./agents/types.js";
-import type { Config } from "./config.js";
+import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
+import type { ModelReasoningEffort } from "@openai/codex-sdk";
 import { AsyncQueue } from "./util/async-queue.js";
 import { log } from "./util/log.js";
 
@@ -32,6 +33,17 @@ const ALL_EFFORTS: Record<AgentKind, string[]> = {
 
 const TTL_MS = 60 * 60 * 1000;
 
+/** The part of the config the catalog reads; the gateway's Config fits. */
+export interface CatalogConfig {
+  /** Where Claude Code is started to ask for its models. */
+  workdir: { path: string };
+  claude: { model?: string; effort?: EffortLevel; executable?: string };
+  codex: { model?: string; reasoningEffort?: ModelReasoningEffort };
+}
+
+/** Loads the full menu for an agent somewhere else (a remote host's runner). */
+export type ModelFetcher = (agent: AgentKind) => Promise<ModelChoice[]>;
+
 /**
  * The models each agent offers, read from the agent itself so the menu
  * follows whatever the installed CLI and account support:
@@ -39,16 +51,21 @@ const TTL_MS = 60 * 60 * 1000;
  * - Codex: the model list the Codex CLI caches in `$CODEX_HOME/models_cache.json`.
  * The first choice is always the default, which is the env model
  * (CLAUDE_MODEL / CODEX_MODEL) when set, else the agent's own default.
+ * With a `fetch`, the list comes from there instead (another host's agents).
  */
 export class ModelCatalog {
   private readonly cache = new Map<AgentKind, { at: number; models: Promise<ModelChoice[]> }>();
 
-  constructor(private readonly cfg: Config) {}
+  constructor(
+    private readonly cfg: CatalogConfig,
+    private readonly fetch?: ModelFetcher,
+  ) {}
 
   list(agent: AgentKind): Promise<ModelChoice[]> {
     const hit = this.cache.get(agent);
     if (hit && Date.now() - hit.at < TTL_MS) return hit.models;
-    const models = (agent === "claude" ? this.loadClaude() : Promise.resolve(this.loadCodex())).catch((err) => {
+    const load = this.fetch ? this.fetch(agent) : agent === "claude" ? this.loadClaude() : Promise.resolve(this.loadCodex());
+    const models = load.catch((err) => {
       log.warn(`could not list ${agent} models`, String(err));
       this.cache.delete(agent); // retry next time
       return [this.defaultChoice(agent)];

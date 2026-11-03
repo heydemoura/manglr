@@ -3,4 +3,5 @@ dist/
 data/
 .env
 projects.json
+hosts.json
 *.log

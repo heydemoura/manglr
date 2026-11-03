@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import type { PermissionMode, EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 import type { ModelReasoningEffort, SandboxMode } from "@openai/codex-sdk";
+import { loadHosts, type HostConfig } from "./hosts.js";
 
 export interface Project {
   name: string;
@@ -22,6 +23,8 @@ export interface Config {
   /** Where every session starts. The agents can still work anywhere on the host. */
   workdir: Project;
   dataDir: string;
+  /** Other computers reachable over SSH (HOSTS_FILE); empty: only this one. */
+  hosts: HostConfig[];
   claude: {
     model?: string;
     effort?: EffortLevel;
@@ -83,6 +86,7 @@ export const GATEWAY_ENV_KEYS = [
   "TELEGRAM_ALLOWED_USER_IDS",
   "AGENT_CWD",
   "DATA_DIR",
+  "HOSTS_FILE",
   "CLAUDE_MODEL",
   "CLAUDE_EFFORT",
   "CLAUDE_PERMISSION_MODE",
@@ -123,6 +127,7 @@ function readConfig(): Config {
     setupMode: chatId === undefined || allowedUserIds.size === 0,
     workdir: loadWorkdir(),
     dataDir: path.resolve(expandHome(optional("DATA_DIR") ?? "data")),
+    hosts: loadHosts(path.resolve(expandHome(optional("HOSTS_FILE") ?? "hosts.json"))),
     claude: {
       model: optional("CLAUDE_MODEL"),
       effort: oneOf("CLAUDE_EFFORT", ["low", "medium", "high", "xhigh", "max"] as const),
