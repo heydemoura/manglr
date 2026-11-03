@@ -189,7 +189,7 @@ export class ClaudeSession implements AgentSession {
     const decision = await this.events.askPermission({
       tool: toolName,
       summary: describeTool(toolName, input, this.init.cwd, 600),
-      reason: blockedPath ? `Outside the project: ${blockedPath}` : decisionReason,
+      reason: blockedPath ? `Outside the working folder: ${blockedPath}` : decisionReason,
       canAlwaysAllow: Boolean(suggestions?.length),
       signal,
     });

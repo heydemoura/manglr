@@ -1,5 +1,5 @@
 import { autoRetry } from "@grammyjs/auto-retry";
-import { Bot } from "grammy";
+import { Bot, GrammyError } from "grammy";
 import { loadConfig, type Config } from "./config.js";
 import { ModelCatalog } from "./models.js";
 import { SessionManager } from "./sessions.js";
@@ -44,7 +44,7 @@ if (cfg.setupMode) {
   await bot.api.setMyCommands(COMMANDS, { scope: { type: "chat", chat_id: cfg.telegram.chatId! } });
   void models.list("claude"); // warm the model menu (starts Claude Code once, no prompt)
   void models.list("codex");
-  log.info(`Serving "${chat.title}" for ${cfg.telegram.allowedUserIds.size} user(s); projects: ${cfg.projects.map((p) => p.name).join(", ")}`);
+  log.info(`Serving "${chat.title}" for ${cfg.telegram.allowedUserIds.size} user(s); sessions start in ${cfg.workdir.path}`);
 }
 
 let stopping = false;
@@ -59,7 +59,17 @@ const shutdown = async (signal: string) => {
 process.on("SIGINT", () => void shutdown("SIGINT"));
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
-await bot.start({
-  allowed_updates: ["message", "callback_query"],
-  onStart: (me) => log.info(`Bot @${me.username} is polling`),
-});
+try {
+  await bot.start({
+    allowed_updates: ["message", "callback_query"],
+    onStart: (me) => log.info(`Bot @${me.username} is polling`),
+  });
+} catch (err) {
+  if (err instanceof GrammyError && err.error_code === 409) {
+    log.error("Another process is polling with this bot token (Telegram allows one). Stop it, then restart the gateway.");
+  } else {
+    log.error("polling stopped", err);
+  }
+  await manager.shutdown().catch(() => undefined);
+  process.exit(1);
+}

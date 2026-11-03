@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { PermissionMode, EffortLevel } from "@anthropic-ai/claude-agent-sdk";
@@ -19,7 +19,8 @@ export interface Config {
   };
   /** Chat or users not configured yet: the bot only answers /whoami. */
   setupMode: boolean;
-  projects: Project[];
+  /** Where every session starts. The agents can still work anywhere on the host. */
+  workdir: Project;
   dataDir: string;
   claude: {
     model?: string;
@@ -60,33 +61,49 @@ function oneOf<T extends string>(name: string, allowed: readonly T[], fallback?:
   return v as T;
 }
 
-function loadProjects(file: string): Project[] {
-  if (!existsSync(file)) {
-    throw new Error(`Projects file not found: ${file} (copy projects.example.json to projects.json)`);
-  }
-  const raw: unknown = JSON.parse(readFileSync(file, "utf8"));
-  if (!Array.isArray(raw) || raw.length === 0) {
-    throw new Error(`${file} must be a non-empty array of { "name", "path" }`);
-  }
-  const projects = raw.map((p, i) => {
-    if (typeof p?.name !== "string" || typeof p?.path !== "string") {
-      throw new Error(`${file}[${i}] needs string "name" and "path"`);
-    }
-    const resolved = path.resolve(expandHome(p.path));
-    if (!existsSync(resolved)) throw new Error(`${file}[${i}] path does not exist: ${resolved}`);
-    // Real path, so the agents' absolute paths can be shown relative to it.
-    return { name: p.name, path: realpathSync(resolved) };
-  });
-  const names = new Set<string>();
-  for (const p of projects) {
-    if (names.has(p.name)) throw new Error(`${file}: duplicate project name "${p.name}"`);
-    names.add(p.name);
-  }
-  return projects;
+/** The folder sessions start in: AGENT_CWD, default the home directory. */
+function loadWorkdir(): Project {
+  const resolved = path.resolve(expandHome(optional("AGENT_CWD") ?? "~"));
+  if (!existsSync(resolved)) throw new Error(`AGENT_CWD does not exist: ${resolved}`);
+  // Real path, so the agents' absolute paths can be shown relative to it.
+  const real = realpathSync(resolved);
+  const home = realpathSync(homedir());
+  const name = real === home ? "~" : real.startsWith(home + path.sep) ? `~${real.slice(home.length)}` : real;
+  return { name, path: real };
 }
+
+/**
+ * The gateway's own settings. They are removed from process.env once read, so
+ * the agents (and every command they run) don't inherit the bot token: a
+ * process started by an agent must not be able to act as the bot.
+ */
+export const GATEWAY_ENV_KEYS = [
+  "TELEGRAM_BOT_TOKEN",
+  "TELEGRAM_CHAT_ID",
+  "TELEGRAM_ALLOWED_USER_IDS",
+  "AGENT_CWD",
+  "DATA_DIR",
+  "CLAUDE_MODEL",
+  "CLAUDE_EFFORT",
+  "CLAUDE_PERMISSION_MODE",
+  "CLAUDE_PATH",
+  "CODEX_MODEL",
+  "CODEX_REASONING_EFFORT",
+  "CODEX_SANDBOX",
+  "CODEX_NETWORK_ACCESS",
+  "CODEX_PATH",
+] as const;
 
 export function loadConfig(): Config {
   if (existsSync(".env")) process.loadEnvFile(".env");
+  try {
+    return readConfig();
+  } finally {
+    for (const key of GATEWAY_ENV_KEYS) delete process.env[key];
+  }
+}
+
+function readConfig(): Config {
 
   const rawChat = optional("TELEGRAM_CHAT_ID");
   const chatId = rawChat === undefined ? undefined : Number(rawChat);
@@ -104,7 +121,7 @@ export function loadConfig(): Config {
   return {
     telegram: { token: required("TELEGRAM_BOT_TOKEN"), chatId, allowedUserIds },
     setupMode: chatId === undefined || allowedUserIds.size === 0,
-    projects: loadProjects(path.resolve(optional("PROJECTS_FILE") ?? "projects.json")),
+    workdir: loadWorkdir(),
     dataDir: path.resolve(expandHome(optional("DATA_DIR") ?? "data")),
     claude: {
       model: optional("CLAUDE_MODEL"),

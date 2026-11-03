@@ -58,7 +58,7 @@ function harness() {
   const cfg = {
     telegram: { token: "1:fake", chatId: CHAT.id, allowedUserIds: new Set([USER.id]) },
     setupMode: false,
-    projects: [{ name: "p", path: "/tmp" }],
+    workdir: { name: "/tmp", path: "/tmp" },
     dataDir: "/tmp",
     claude: { permissionMode: "default" },
     codex: { sandboxMode: "workspace-write", networkAccess: false },

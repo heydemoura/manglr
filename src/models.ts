@@ -60,7 +60,7 @@ export class ModelCatalog {
     const q = query({
       prompt: input,
       options: {
-        cwd: this.cfg.projects[0]?.path ?? homedir(),
+        cwd: this.cfg.workdir.path,
         pathToClaudeCodeExecutable: this.cfg.claude.executable,
       },
     });

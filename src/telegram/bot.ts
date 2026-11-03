@@ -61,6 +61,7 @@ export function registerHandlers(
   bot.use(async (ctx, next) => {
     if (cfg.setupMode) return;
     const uid = ctx.from?.id;
+    if (uid === ctx.me.id) return; // service messages about our own topic edits
     if (!uid || !cfg.telegram.allowedUserIds.has(uid)) {
       log.warn(`ignored update from user ${uid ?? "?"} in chat ${ctx.chat?.id ?? "?"}`);
       return;
@@ -77,7 +78,7 @@ export function registerHandlers(
     ctx.reply(
       [
         "<b>Agent gateway</b>",
-        "• /new [task]: pick Claude or Codex and a project; a new thread opens for the session.",
+        "• /new [task]: pick Claude or Codex; a new thread opens for the session.",
         "• Reply in a thread to talk to its agent. Messages sent while it works are passed along.",
         "• Tool permission requests (Claude) show up with Allow / Deny buttons.",
         "• /model switches the model of a thread's session.",
@@ -233,22 +234,7 @@ export function registerHandlers(
     if (step === "a" && (value === "claude" || value === "codex")) {
       wizard.agent = value;
       await ctx.answerCallbackQuery();
-      if (cfg.projects.length === 1) return finish(ctx, messageId!, wizard, cfg.projects[0]!);
-      const keyboard = new InlineKeyboard();
-      cfg.projects.forEach((p, i) => {
-        keyboard.text(p.name, `new:p:${i}`);
-        if (i % 2 === 1) keyboard.row();
-      });
-      keyboard.row().text("Cancel", "new:x");
-      return void (await ctx.editMessageText(`${AGENTS[value].emoji} <b>${AGENTS[value].label}</b>. Which project?`, {
-        parse_mode: "HTML",
-        reply_markup: keyboard,
-      }));
-    }
-    if (step === "p" && wizard.agent) {
-      const project = cfg.projects[Number(value)];
-      await ctx.answerCallbackQuery();
-      if (project) return finish(ctx, messageId!, wizard, project);
+      return finish(ctx, messageId!, wizard, cfg.workdir);
     }
     await ctx.answerCallbackQuery({ text: "Unknown choice." });
   });
@@ -257,7 +243,7 @@ export function registerHandlers(
     wizards.delete(menuId);
     const agent = wizard.agent!;
     const a = AGENTS[agent];
-    const title = wizard.task ? clip(firstLine(wizard.task), 60) : `${a.label} · ${project.name}`;
+    const title = wizard.task ? clip(firstLine(wizard.task), 60) : `New ${a.label} session`;
     let topicId: number;
     try {
       topicId = (await bot.api.createForumTopic(chatId!, clip(`${a.emoji} ${title}`, 128))).message_thread_id;
@@ -274,7 +260,7 @@ export function registerHandlers(
     }
     manager.create(topicId, agent, project, title, !wizard.task);
 
-    await ctx.editMessageText(`${a.emoji} <b>${a.label}</b> on <b>${escapeHtml(project.name)}</b> → <a href="${topicLink(topicId)}">${escapeHtml(title)}</a>`, {
+    await ctx.editMessageText(`${a.emoji} <b>${a.label}</b> → <a href="${topicLink(topicId)}">${escapeHtml(title)}</a>`, {
       parse_mode: "HTML",
       link_preview_options: { is_disabled: true },
     });

@@ -7,7 +7,7 @@ in the thread become its next input.
 
 ```
 General:   /new fix the login redirect
-           → [🟠 Claude] [🟢 Codex] → [project] → new thread "🟠 fix the login redirect"
+           → [🟠 Claude] [🟢 Codex] → new thread "🟠 fix the login redirect"
 Thread:    ⏳ Working…  (edited live: 💻 npm test · ✏️ Edit src/auth.ts …)  [⏹ Stop]
            🔐 Bash needs permission  `git push`   [Allow] [Always allow] [Deny]
            💬 the agent's answer
@@ -31,7 +31,6 @@ your existing `claude` and `codex` logins on this host.
    ```sh
    npm install
    cp .env.example .env              # put the bot token in TELEGRAM_BOT_TOKEN
-   cp projects.example.json projects.json   # the folders agents may work in
    npm run dev
    ```
    With no chat id or users configured the bot runs in **setup mode**: send
@@ -45,7 +44,7 @@ Requirements: Node 22+, a logged-in Claude Code (`claude`) and Codex (`codex log
 
 | | |
 |---|---|
-| `/new [task]` | Pick the agent and project; opens a thread. With a task it starts right away, otherwise the first message in the thread starts it (and names the thread). |
+| `/new [task]` | Pick the agent; opens a thread. With a task it starts right away, otherwise the first message in the thread starts it (and names the thread). |
 | reply in a thread | Goes to that session. While it works: Claude folds it into the running turn, Codex queues it for the next turn. |
 | `/model` or 🧠 | Switch this thread's model from a button menu (also on the thread's first message and on `/status`). |
 | `/stop` or ⏹ | Interrupts the running turn; the session continues with your next message. |
@@ -74,10 +73,14 @@ After a restart, the next message in a thread resumes its session.
 ## Security
 
 The bot can run commands on this host. It ignores every update that isn't
-from `TELEGRAM_ALLOWED_USER_IDS` inside `TELEGRAM_CHAT_ID`, and agents only start
-in folders from `projects.json` (Claude can still ask to touch paths outside it,
-which you'll see as a permission request). Keep `.env` private; anyone with the
-token can impersonate the bot, not you.
+from `TELEGRAM_ALLOWED_USER_IDS` inside `TELEGRAM_CHAT_ID`. Sessions start in
+`AGENT_CWD` (default: your home directory); tell the agent in your message which
+folder to work in. With the default permission settings Claude asks before
+touching anything outside that folder; with `CLAUDE_PERMISSION_MODE=bypassPermissions`
+and `CODEX_SANDBOX=danger-full-access` both agents have full access to the host,
+so whoever controls your Telegram account controls this machine: turn on
+Telegram's two-step verification. Keep `.env` private; anyone with the token can
+impersonate the bot, not you.
 
 ## Development
 
@@ -99,7 +102,7 @@ denies permission requests.
 
 ```
 src/index.ts              wiring, startup checks, shutdown
-src/config.ts             .env + projects.json
+src/config.ts             .env
 src/store.ts              topic ↔ session records (data/sessions.json)
 src/sessions.ts           live sessions per topic, lazy resume, per-thread model
 src/models.ts             model menu entries, read from each agent
