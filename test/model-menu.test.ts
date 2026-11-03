@@ -6,7 +6,7 @@ import path from "node:path";
 import { Bot } from "grammy";
 import type { Update } from "grammy/types";
 import type { Config } from "../src/config.js";
-import type { ModelCatalog, ModelChoice } from "../src/models.js";
+import { ModelCatalog, type ModelChoice } from "../src/models.js";
 import type { SessionManager } from "../src/sessions.js";
 import { SessionStore } from "../src/store.js";
 import { registerHandlers } from "../src/telegram/bot.js";
@@ -16,11 +16,12 @@ const CHAT = { id: -1001234567890, type: "supergroup" as const, title: "agents",
 const USER = { id: 42, is_bot: false, first_name: "me" };
 const TOPIC = 7;
 
+const ALL = ["low", "medium", "high", "xhigh", "max"];
 const CLAUDE_MODELS: ModelChoice[] = [
-  { value: "", label: "Default", description: "Opus 5.5" },
-  { value: "opus", label: "Opus 5.5" },
-  { value: "sonnet", label: "Sonnet 5.5" },
-  { value: "haiku", label: "Haiku 5.5" },
+  { value: "", label: "Default", description: "Opus 5.5", efforts: ALL },
+  { value: "opus", label: "Opus 5.5", efforts: ALL },
+  { value: "sonnet", label: "Sonnet 5.5", efforts: ["low", "medium", "high"] },
+  { value: "haiku", label: "Haiku 5.5", efforts: [] },
 ];
 
 interface Call {
@@ -46,6 +47,7 @@ function harness() {
   const store = new SessionStore(mkdtempSync(path.join(tmpdir(), "manglr-test-")));
   store.upsert({ topicId: TOPIC, agent: "claude", project: "p", cwd: "/tmp", title: "t" });
   const switched: (string | undefined)[] = [];
+  const efforts: (string | undefined)[] = [];
   const started: string[] = [];
   const manager = {
     isBusy: () => false,
@@ -56,15 +58,11 @@ function harness() {
       switched.push(model);
       store.update(topicId, { model });
     },
-  } as unknown as SessionManager;
-  const models = {
-    list: async () => CLAUDE_MODELS,
-    defaultName: async () => CLAUDE_MODELS[0]!.description,
-    label: async (_a: string, v: string | undefined) => {
-      const m = CLAUDE_MODELS.find((x) => x.value === (v ?? ""))!;
-      return v ? m.label : `${m.label} (${m.description})`;
+    setEffort: async (topicId: number, effort: string | undefined) => {
+      efforts.push(effort);
+      store.update(topicId, { effort });
     },
-  } as unknown as ModelCatalog;
+  } as unknown as SessionManager;
   const cfg = {
     telegram: { token: "1:fake", chatId: CHAT.id, allowedUserIds: new Set([USER.id]) },
     setupMode: false,
@@ -73,6 +71,9 @@ function harness() {
     claude: { permissionMode: "default" },
     codex: { sandboxMode: "workspace-write", networkAccess: false },
   } as Config;
+  // The real catalog, with the list Claude Code would report.
+  const models = new ModelCatalog(cfg);
+  models.list = async () => CLAUDE_MODELS;
   registerHandlers(bot, cfg, store, manager, {} as PermissionBroker, models);
 
   let updateId = 0;
@@ -100,7 +101,7 @@ function harness() {
         message: { message_id: messageId, date: 0, chat: CHAT, text: "menu", message_thread_id: TOPIC, is_topic_message: true },
       },
     } as Update);
-  return { bot, calls, store, switched, started, send, tap };
+  return { bot, calls, store, switched, efforts, started, send, tap };
 }
 
 const buttons = (call: Call): { text: string; callback_data: string }[] => call.payload.reply_markup.inline_keyboard.flat();
@@ -156,7 +157,10 @@ test("the 🧠 button on /status opens the picker; /model outside a thread expla
   const h = harness();
   await h.bot.init();
   await h.send("/status");
-  assert.deepEqual(buttons(last(h.calls, "sendMessage")), [{ text: "🧠 Change model", callback_data: "mdl:o" }]);
+  assert.deepEqual(buttons(last(h.calls, "sendMessage")), [
+    { text: "🧠 Change model", callback_data: "mdl:o" },
+    { text: "⚡ Change effort", callback_data: "eff:o" },
+  ]);
   await h.tap("mdl:o");
   assert.match(last(h.calls, "sendMessage").payload.text, /🧠 <b>Model<\/b>/);
   await h.send("/model", null); // General, not a thread
@@ -181,7 +185,86 @@ test("a new thread starts on the host's default model without asking", async () 
   const welcome = last(h.calls, "sendMessage");
   assert.equal(welcome.payload.message_thread_id, TOPIC + 1);
   assert.match(welcome.payload.text, /🧠 Opus 5\.5 <i>\(default, \/model to switch\)<\/i>/);
+  assert.match(welcome.payload.text, /⚡ Default effort <i>\(\/effort to switch\)<\/i>/);
   assert.equal(welcome.payload.reply_markup, undefined);
   assert.equal(h.store.get(TOPIC + 1)!.model, undefined);
   assert.deepEqual(h.started, ["fix the tests"]);
+});
+
+test("/effort lists the current model's levels with the current one checked", async () => {
+  const h = harness();
+  await h.bot.init();
+  await h.send("/effort");
+  const msg = last(h.calls, "sendMessage");
+  assert.equal(msg.payload.message_thread_id, TOPIC);
+  assert.match(msg.payload.text, /⚡ <b>Effort<\/b> · 🟠 Claude · Default \(Opus 5\.5\)/);
+  assert.match(msg.payload.text, /Now: <b>Default<\/b>/);
+  assert.deepEqual(
+    buttons(msg).map((b) => b.callback_data),
+    ["eff:s:", "eff:s:low", "eff:s:medium", "eff:s:high", "eff:s:xhigh", "eff:s:max", "eff:x"],
+  );
+  assert.equal(buttons(msg)[0]!.text, "✓ Default");
+
+  // On Sonnet only its own levels are offered.
+  h.store.update(TOPIC, { model: "sonnet" });
+  await h.send("/effort");
+  assert.deepEqual(
+    buttons(last(h.calls, "sendMessage")).map((b) => b.callback_data),
+    ["eff:s:", "eff:s:low", "eff:s:medium", "eff:s:high", "eff:x"],
+  );
+});
+
+test("tapping an effort switches the session; Default switches back", async () => {
+  const h = harness();
+  await h.bot.init();
+  await h.tap("eff:s:xhigh");
+  assert.deepEqual(h.efforts, ["xhigh"]);
+  assert.equal(h.store.get(TOPIC)!.effort, "xhigh");
+  assert.equal(last(h.calls, "answerCallbackQuery").payload.text, "Effort: xhigh");
+  assert.match(last(h.calls, "editMessageText").payload.text, /Effort → <b>xhigh<\/b>\n<i>Applies from Claude's next response\.<\/i>/);
+
+  await h.send("/status");
+  assert.match(last(h.calls, "sendMessage").payload.text, /effort: xhigh/);
+
+  await h.tap("eff:s:xhigh");
+  assert.match(last(h.calls, "answerCallbackQuery").payload.text, /Already on xhigh/);
+  await h.tap("eff:s:");
+  assert.deepEqual(h.efforts, ["xhigh", undefined]);
+  assert.equal(h.store.get(TOPIC)!.effort, undefined);
+});
+
+test("efforts the model doesn't offer are refused", async () => {
+  const h = harness();
+  await h.bot.init();
+  h.store.update(TOPIC, { model: "haiku" });
+  await h.send("/effort");
+  assert.deepEqual(buttons(last(h.calls, "sendMessage")).map((b) => b.callback_data), ["eff:s:", "eff:x"]);
+  await h.tap("eff:s:high");
+  assert.match(last(h.calls, "answerCallbackQuery").payload.text, /doesn't offer that effort/);
+  assert.deepEqual(h.efforts, []);
+});
+
+test("switching to a model without the current effort resets it to the default", async () => {
+  const h = harness();
+  await h.bot.init();
+  h.store.update(TOPIC, { effort: "max" });
+  await h.tap("mdl:s:sonnet");
+  assert.deepEqual(h.switched, ["sonnet"]);
+  assert.deepEqual(h.efforts, [undefined]);
+  assert.match(last(h.calls, "editMessageText").payload.text, /Sonnet 5\.5 has no <b>max<\/b> effort: back to Default\./);
+
+  // A level the new model has is kept.
+  h.store.update(TOPIC, { effort: "high" });
+  await h.tap("mdl:s:opus");
+  assert.deepEqual(h.efforts, [undefined]);
+  assert.equal(h.store.get(TOPIC)!.effort, "high");
+});
+
+test("ended sessions refuse effort changes", async () => {
+  const h = harness();
+  await h.bot.init();
+  h.store.update(TOPIC, { closed: true });
+  await h.tap("eff:s:low");
+  assert.equal(last(h.calls, "answerCallbackQuery").payload.text, "This session has ended.");
+  assert.deepEqual(h.efforts, []);
 });

@@ -12,7 +12,23 @@ export interface ModelChoice {
   value: string;
   label: string;
   description?: string;
+  /** Effort levels this model accepts ([]: none); undefined when the agent doesn't say. */
+  efforts?: string[];
+  /** The effort it runs at when none is picked, when the agent says so. */
+  defaultEffort?: string;
 }
+
+export interface EffortChoice {
+  /** "" is the default (no per-session override). */
+  value: string;
+  label: string;
+}
+
+/** Every level each agent knows, for models that don't list their own. */
+const ALL_EFFORTS: Record<AgentKind, string[]> = {
+  claude: ["low", "medium", "high", "xhigh", "max"],
+  codex: ["minimal", "low", "medium", "high", "xhigh"],
+};
 
 const TTL_MS = 60 * 60 * 1000;
 
@@ -55,9 +71,37 @@ export class ModelCatalog {
     return def?.description ?? "the agent's default model";
   }
 
-  private defaultChoice(agent: AgentKind, description?: string): ModelChoice {
+  /**
+   * The effort menu for a session on `model` ("" / undefined: the default
+   * model): Default first, then the levels that model accepts.
+   */
+  async efforts(agent: AgentKind, model: string | undefined): Promise<EffortChoice[]> {
+    const m = await this.model(agent, model);
+    const levels = m?.efforts ?? ALL_EFFORTS[agent]; // [] : the model takes no effort setting
+    const env = agent === "claude" ? this.cfg.claude.effort : this.cfg.codex.reasoningEffort;
+    const def = env ?? m?.defaultEffort;
+    return [{ value: "", label: def ? `Default (${def})` : "Default" }, ...levels.map((l) => ({ value: l, label: l }))];
+  }
+
+  /** Human label for a session's effort ("" / undefined: the default). */
+  async effortLabel(agent: AgentKind, model: string | undefined, effort: string | undefined): Promise<string> {
+    if (effort) return effort;
+    return (await this.efforts(agent, model))[0]!.label;
+  }
+
+  /** Whether `effort` can be kept after switching to `model` (unknown levels: assume yes). */
+  async supportsEffort(agent: AgentKind, model: string | undefined, effort: string): Promise<boolean> {
+    const levels = (await this.model(agent, model))?.efforts;
+    return !levels || levels.includes(effort);
+  }
+
+  private async model(agent: AgentKind, model: string | undefined): Promise<ModelChoice | undefined> {
+    return (await this.list(agent)).find((m) => m.value === (model ?? ""));
+  }
+
+  private defaultChoice(agent: AgentKind, description?: string, levels?: Pick<ModelChoice, "efforts" | "defaultEffort">): ModelChoice {
     const env = agent === "claude" ? this.cfg.claude.model : this.cfg.codex.model;
-    return { value: "", label: "Default", description: env ?? description };
+    return { value: "", label: "Default", description: env ?? description, ...levels };
   }
 
   private async loadClaude(): Promise<ModelChoice[]> {
@@ -73,9 +117,12 @@ export class ModelCatalog {
     try {
       const rows = await q.supportedModels();
       const def = rows.find((r) => r.value === "default");
+      const levels = (r?: (typeof rows)[number]) => ({ efforts: r?.supportsEffort === false ? [] : r?.supportedEffortLevels });
       return [
-        this.defaultChoice("claude", def?.description.split(" · ")[0]),
-        ...rows.filter((r) => r.value !== "default").map((r) => ({ value: r.value, label: r.displayName, description: r.description })),
+        this.defaultChoice("claude", def?.description.split(" · ")[0], levels(def)),
+        ...rows
+          .filter((r) => r.value !== "default")
+          .map((r) => ({ value: r.value, label: r.displayName, description: r.description, ...levels(r) })),
       ];
     } finally {
       input.end();
@@ -85,15 +132,26 @@ export class ModelCatalog {
 
   private loadCodex(): ModelChoice[] {
     const home = process.env.CODEX_HOME ?? path.join(homedir(), ".codex");
-    const def = this.defaultChoice("codex", readCodexConfigModel(path.join(home, "config.toml")));
+    const configFile = path.join(home, "config.toml");
+    const configModel = readCodexConfig(configFile, "model");
+    const configEffort = readCodexConfig(configFile, "model_reasoning_effort");
     const file = path.join(home, "models_cache.json");
-    if (!existsSync(file)) return [def];
+    if (!existsSync(file)) return [this.defaultChoice("codex", configModel)];
     const raw = JSON.parse(readFileSync(file, "utf8")) as { models?: unknown };
     const rows = Array.isArray(raw.models) ? (raw.models as CodexModelRow[]) : [];
     const models = rows
       .filter((m) => typeof m.slug === "string" && m.visibility === "list")
       .sort((a, b) => (a.priority ?? 99) - (b.priority ?? 99))
-      .map((m) => ({ value: m.slug, label: m.display_name ?? m.slug, description: m.description }));
+      .map((m) => ({
+        value: m.slug,
+        label: m.display_name ?? m.slug,
+        description: m.description,
+        efforts: m.supported_reasoning_levels?.map((l) => l.effort).filter((e): e is string => typeof e === "string"),
+        defaultEffort: m.default_reasoning_level,
+      }));
+    // "Default" is the config.toml model (or, without one, Codex's first listed model).
+    const target = models.find((m) => m.value === (this.cfg.codex.model ?? configModel)) ?? (configModel ? undefined : models[0]);
+    const def = this.defaultChoice("codex", configModel, { efforts: target?.efforts, defaultEffort: configEffort ?? target?.defaultEffort });
     return [def, ...models];
   }
 }
@@ -104,14 +162,16 @@ interface CodexModelRow {
   description?: string;
   visibility?: string;
   priority?: number;
+  supported_reasoning_levels?: { effort?: unknown }[];
+  default_reasoning_level?: string;
 }
 
-/** The top-level `model = "…"` in Codex's config.toml, for showing what "Default" means. */
-function readCodexConfigModel(file: string): string | undefined {
+/** A top-level `key = "…"` in Codex's config.toml, for showing what "Default" means. */
+function readCodexConfig(file: string, key: string): string | undefined {
   if (!existsSync(file)) return undefined;
   for (const line of readFileSync(file, "utf8").split("\n")) {
     if (line.trim().startsWith("[")) break; // only top-level keys
-    const m = /^\s*model\s*=\s*"([^"]+)"/.exec(line);
+    const m = new RegExp(`^\\s*${key}\\s*=\\s*"([^"]+)"`).exec(line);
     if (m) return m[1];
   }
   return undefined;

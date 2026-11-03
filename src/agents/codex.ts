@@ -1,5 +1,5 @@
 import path from "node:path";
-import { Codex, type Thread, type ThreadEvent, type ThreadItem, type ThreadOptions } from "@openai/codex-sdk";
+import { Codex, type ModelReasoningEffort, type Thread, type ThreadEvent, type ThreadItem, type ThreadOptions } from "@openai/codex-sdk";
 import type { Config } from "../config.js";
 import { oneLineCommand } from "../util/command.js";
 import { log } from "../util/log.js";
@@ -11,6 +11,8 @@ export interface CodexSessionInit {
   resume?: string;
   /** Model for this session; undefined: Codex's default (config.toml). */
   model?: string;
+  /** Reasoning effort for this session; undefined: Codex's default. */
+  effort?: string;
 }
 
 /**
@@ -26,8 +28,10 @@ export class CodexSession implements AgentSession {
   /** Known once the first turn starts (or from `resume`). */
   private threadId?: string;
   private model?: string;
-  /** The model `thread` was opened with: a different one means reopen it. */
+  private effort?: string;
+  /** The model and effort `thread` was opened with: different ones mean reopen it. */
   private threadModel?: string;
+  private threadEffort?: string;
   private abort?: AbortController;
   private queued: string[] = [];
   private running = false;
@@ -42,6 +46,7 @@ export class CodexSession implements AgentSession {
     this.codex = new Codex({ codexPathOverride: cfg.executable });
     this.threadId = init.resume;
     this.model = init.model;
+    this.effort = init.effort;
   }
 
   get busy(): boolean {
@@ -60,6 +65,11 @@ export class CodexSession implements AgentSession {
     this.model = model;
   }
 
+  async setEffort(effort: string | undefined): Promise<void> {
+    // Like setModel: the next turn resumes the thread with the new effort.
+    this.effort = effort;
+  }
+
   async interrupt(): Promise<void> {
     this.queued = [];
     this.abort?.abort();
@@ -71,11 +81,11 @@ export class CodexSession implements AgentSession {
   }
 
   private getThread(): Thread {
-    if (this.thread && this.threadModel === this.model) return this.thread;
+    if (this.thread && this.threadModel === this.model && this.threadEffort === this.effort) return this.thread;
     const options: ThreadOptions = {
       workingDirectory: this.init.cwd,
       model: this.model,
-      modelReasoningEffort: this.cfg.reasoningEffort,
+      modelReasoningEffort: this.effort as ModelReasoningEffort | undefined,
       sandboxMode: this.cfg.sandboxMode,
       networkAccessEnabled: this.cfg.networkAccess,
       approvalPolicy: "never",
@@ -83,6 +93,7 @@ export class CodexSession implements AgentSession {
     };
     this.thread = this.threadId ? this.codex.resumeThread(this.threadId, options) : this.codex.startThread(options);
     this.threadModel = this.model;
+    this.threadEffort = this.effort;
     return this.thread;
   }
 
