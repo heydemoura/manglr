@@ -65,11 +65,15 @@ try {
     onStart: (me) => log.info(`Bot @${me.username} is polling`),
   });
 } catch (err) {
-  if (err instanceof GrammyError && err.error_code === 409) {
-    log.error("Another process is polling with this bot token (Telegram allows one). Stop it, then restart the gateway.");
-  } else {
-    log.error("polling stopped", err);
+  // bot.stop() during a retry backoff rejects start() with "Aborted delay".
+  // That's our own shutdown, which finishes and exits on its own.
+  if (!stopping) {
+    if (err instanceof GrammyError && err.error_code === 409) {
+      log.error("Another process is polling with this bot token (Telegram allows one). Stop it, then restart the gateway.");
+    } else {
+      log.error("polling stopped", err);
+    }
+    await manager.shutdown().catch(() => undefined);
+    process.exit(1);
   }
-  await manager.shutdown().catch(() => undefined);
-  process.exit(1);
 }
