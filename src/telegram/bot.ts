@@ -1,0 +1,335 @@
+import { Bot, InlineKeyboard, type Context } from "grammy";
+import { AGENTS, type AgentKind } from "../agents/types.js";
+import type { Config, Project } from "../config.js";
+import type { ModelCatalog } from "../models.js";
+import type { SessionManager } from "../sessions.js";
+import type { SessionRecord, SessionStore } from "../store.js";
+import { log } from "../util/log.js";
+import { escapeHtml } from "./format.js";
+import type { PermissionBroker } from "./permissions.js";
+
+export const COMMANDS = [
+  { command: "new", description: "Start an agent session in a new thread" },
+  { command: "list", description: "Open sessions" },
+  { command: "model", description: "Switch this thread's model" },
+  { command: "stop", description: "Stop the running turn (in a thread)" },
+  { command: "end", description: "End this thread's session" },
+  { command: "status", description: "Session details (in a thread)" },
+  { command: "help", description: "How this works" },
+];
+
+interface Wizard {
+  task?: string;
+  agent?: AgentKind;
+  userId: number;
+}
+
+const clip = (s: string, max: number) => (s.length > max ? `${s.slice(0, max - 1)}…` : s);
+const firstLine = (s: string) => s.trim().split("\n")[0]!.trim();
+
+/** The forum topic a message belongs to, or undefined for General / non-topic chats. */
+const topicOf = (ctx: Context): number | undefined => {
+  const msg = ctx.msg ?? ctx.callbackQuery?.message;
+  return msg && "is_topic_message" in msg && msg.is_topic_message ? msg.message_thread_id : undefined;
+};
+
+export function registerHandlers(
+  bot: Bot,
+  cfg: Config,
+  store: SessionStore,
+  manager: SessionManager,
+  permissions: PermissionBroker,
+  models: ModelCatalog,
+): void {
+  const chatId = cfg.telegram.chatId;
+  const wizards = new Map<number, Wizard>();
+  const claudeBypass = cfg.claude.permissionMode === "bypassPermissions";
+  const codexFull = cfg.codex.sandboxMode === "danger-full-access";
+  const topicLink = (topicId: number) => `https://t.me/c/${String(chatId).replace(/^-100/, "")}/${topicId}`;
+
+  // --- setup helper, before the auth gate --------------------------------------
+  bot.command("whoami", async (ctx) => {
+    if (!cfg.setupMode && !cfg.telegram.allowedUserIds.has(ctx.from?.id ?? 0)) return;
+    await ctx.reply(
+      `chat id: <code>${ctx.chat.id}</code>\nyour user id: <code>${ctx.from?.id}</code>\nchat type: ${ctx.chat.type}` +
+        ("is_forum" in ctx.chat && ctx.chat.is_forum ? " (topics on)" : ""),
+      { parse_mode: "HTML", message_thread_id: topicOf(ctx) },
+    );
+  });
+
+  // --- auth gate: only the configured group, only allowed users ---------------
+  bot.use(async (ctx, next) => {
+    if (cfg.setupMode) return;
+    const uid = ctx.from?.id;
+    if (!uid || !cfg.telegram.allowedUserIds.has(uid)) {
+      log.warn(`ignored update from user ${uid ?? "?"} in chat ${ctx.chat?.id ?? "?"}`);
+      return;
+    }
+    if (ctx.chat && ctx.chat.id !== chatId) {
+      if (ctx.chat.type === "private") await ctx.reply("I work in the configured group. Use /new there.");
+      return;
+    }
+    await next();
+  });
+
+  // --- commands -----------------------------------------------------------------
+  bot.command(["help", "start"], (ctx) =>
+    ctx.reply(
+      [
+        "<b>Agent gateway</b>",
+        "• /new [task]: pick Claude or Codex and a project; a new thread opens for the session.",
+        "• Reply in a thread to talk to its agent. Messages sent while it works are passed along.",
+        "• Tool permission requests (Claude) show up with Allow / Deny buttons.",
+        "• /model switches the model of a thread's session.",
+        "• /stop stops the current turn, /end ends the session, /status shows details, /list lists sessions.",
+      ].join("\n"),
+      { parse_mode: "HTML", message_thread_id: topicOf(ctx) },
+    ),
+  );
+
+  bot.command("new", async (ctx) => {
+    const task = ctx.match.trim() || undefined;
+    const keyboard = new InlineKeyboard();
+    for (const [kind, a] of Object.entries(AGENTS)) keyboard.text(`${a.emoji} ${a.label}`, `new:a:${kind}`);
+    keyboard.row().text("Cancel", "new:x");
+    const prompt = task ? `New session for:\n<i>${escapeHtml(clip(task, 300))}</i>\n\nWhich agent?` : "New session. Which agent?";
+    const msg = await ctx.reply(prompt, { parse_mode: "HTML", reply_markup: keyboard, message_thread_id: topicOf(ctx) });
+    wizards.set(msg.message_id, { task, userId: ctx.from!.id });
+  });
+
+  bot.command("list", async (ctx) => {
+    const open = store.list().filter((r) => !r.closed);
+    if (open.length === 0) return void (await ctx.reply("No open sessions. Start one with /new.", { message_thread_id: topicOf(ctx) }));
+    const lines = open.map((r) => {
+      const busy = manager.isBusy(r.topicId) ? " · ⏳ working" : "";
+      return `${AGENTS[r.agent].emoji} <a href="${topicLink(r.topicId)}">${escapeHtml(r.title)}</a> · ${escapeHtml(r.project)}${busy}`;
+    });
+    await ctx.reply(lines.join("\n"), { parse_mode: "HTML", message_thread_id: topicOf(ctx), link_preview_options: { is_disabled: true } });
+  });
+
+  bot.command("stop", async (ctx) => {
+    const topicId = topicOf(ctx);
+    if (topicId === undefined) return void (await ctx.reply("Use /stop inside a session thread."));
+    const stopped = await manager.stop(topicId);
+    await ctx.reply(stopped ? "⏹ Stopping…" : "Nothing is running.", { message_thread_id: topicId });
+  });
+
+  bot.command("end", async (ctx) => {
+    const topicId = topicOf(ctx);
+    const rec = topicId === undefined ? undefined : store.get(topicId);
+    if (topicId === undefined || !rec || rec.closed) return void (await ctx.reply("Use /end inside an open session thread.", { message_thread_id: topicId }));
+    await manager.end(topicId);
+    await ctx.reply(
+      `Session ended. Its transcript stays on the host${rec.sessionId ? ` (<code>${escapeHtml(rec.sessionId)}</code>)` : ""}.`,
+      { parse_mode: "HTML", message_thread_id: topicId },
+    );
+    await bot.api.closeForumTopic(chatId!, topicId).catch((err) => log.warn("closeForumTopic failed", String(err)));
+  });
+
+  bot.command("status", async (ctx) => {
+    const topicId = topicOf(ctx);
+    const rec = topicId === undefined ? undefined : store.get(topicId);
+    if (!rec) return void (await ctx.reply("Use /status inside a session thread.", { message_thread_id: topicId }));
+    const lines = [
+      `${AGENTS[rec.agent].emoji} <b>${AGENTS[rec.agent].label}</b> · ${escapeHtml(rec.project)}`,
+      `folder: <code>${escapeHtml(rec.cwd)}</code>`,
+      `session: <code>${escapeHtml(rec.sessionId ?? "not started")}</code>`,
+      `model: ${escapeHtml(await models.label(rec.agent, rec.model))}`,
+      rec.agent === "claude"
+        ? `permissions: ${escapeHtml(cfg.claude.permissionMode)}${claudeBypass ? " (full access, no prompts)" : " (asks here when needed)"}`
+        : `sandbox: ${escapeHtml(cfg.codex.sandboxMode)}${codexFull ? " (full access)" : `, network ${cfg.codex.networkAccess ? "on" : "off"}`}`,
+      `state: ${rec.closed ? "ended" : manager.isBusy(rec.topicId) ? "⏳ working" : "idle"}`,
+    ];
+    await ctx.reply(lines.join("\n"), {
+      parse_mode: "HTML",
+      message_thread_id: topicId,
+      reply_markup: rec.closed ? undefined : new InlineKeyboard().text("🧠 Change model", "mdl:o"),
+    });
+  });
+
+  bot.command("model", async (ctx) => {
+    const topicId = topicOf(ctx);
+    const rec = topicId === undefined ? undefined : store.get(topicId);
+    if (!rec || rec.closed) return void (await ctx.reply("Use /model inside an open session thread.", { message_thread_id: topicId }));
+    const menu = await modelMenu(rec);
+    await ctx.reply(menu.text, { parse_mode: "HTML", message_thread_id: topicId, reply_markup: menu.keyboard });
+  });
+
+  // --- model picker -------------------------------------------------------------------
+  async function modelMenu(rec: SessionRecord): Promise<{ text: string; keyboard: InlineKeyboard }> {
+    const a = AGENTS[rec.agent];
+    const current = rec.model ?? "";
+    const keyboard = new InlineKeyboard();
+    let col = 0;
+    for (const m of await models.list(rec.agent)) {
+      const data = `mdl:s:${m.value}`;
+      if (Buffer.byteLength(data) > 64) continue; // Telegram's callback data limit
+      keyboard.text(`${m.value === current ? "✓ " : ""}${m.label}`, data);
+      if (++col % 2 === 0) keyboard.row();
+    }
+    if (col % 2 !== 0) keyboard.row();
+    keyboard.text("Close", "mdl:x");
+    const when = rec.agent === "claude" ? "Claude switches from its next response, also mid-turn." : "Codex switches from its next turn.";
+    const text =
+      `🧠 <b>Model</b> · ${a.emoji} ${a.label}\n` +
+      `Now: <b>${escapeHtml(await models.label(rec.agent, rec.model))}</b>\n` +
+      `<i>${when}</i>`;
+    return { text, keyboard };
+  }
+
+  bot.callbackQuery(/^mdl:/, async (ctx) => {
+    const topicId = topicOf(ctx);
+    const rec = topicId === undefined ? undefined : store.get(topicId);
+    if (topicId === undefined || !rec || rec.closed) {
+      return void (await ctx.answerCallbackQuery({ text: "This session has ended." }));
+    }
+    const data = ctx.callbackQuery.data;
+
+    if (data === "mdl:x") {
+      await ctx.answerCallbackQuery();
+      return void (await ctx.deleteMessage().catch(() => ctx.editMessageReplyMarkup()));
+    }
+    if (data === "mdl:o") {
+      await ctx.answerCallbackQuery();
+      const menu = await modelMenu(rec);
+      return void (await ctx.reply(menu.text, { parse_mode: "HTML", message_thread_id: topicId, reply_markup: menu.keyboard }));
+    }
+    if (data.startsWith("mdl:s:")) {
+      const value = data.slice("mdl:s:".length);
+      const choice = (await models.list(rec.agent)).find((m) => m.value === value);
+      if (!choice) return void (await ctx.answerCallbackQuery({ text: "That model is no longer offered. Run /model again." }));
+      if (value === (rec.model ?? "")) {
+        return void (await ctx.answerCallbackQuery({ text: `Already on ${choice.label}.` }));
+      }
+      try {
+        await manager.setModel(topicId, value || undefined);
+      } catch (err) {
+        log.warn("setModel failed", String(err));
+        return void (await ctx.answerCallbackQuery({ text: `Could not switch: ${String(err).slice(0, 150)}` }));
+      }
+      await ctx.answerCallbackQuery({ text: `Model: ${choice.label}` });
+      const label = await models.label(rec.agent, value || undefined);
+      const when = rec.agent === "claude" ? "from Claude's next response" : manager.isBusy(topicId) ? "from Codex's next turn" : "from the next message";
+      log.info(`topic ${topicId}: model → ${value || "default"}`);
+      return void (await ctx.editMessageText(`🧠 Model → <b>${escapeHtml(label)}</b>\n<i>Applies ${when}.</i>`, { parse_mode: "HTML" }));
+    }
+    await ctx.answerCallbackQuery({ text: "Unknown choice." });
+  });
+
+  // --- /new wizard ------------------------------------------------------------------
+  bot.callbackQuery(/^new:/, async (ctx) => {
+    const messageId = ctx.callbackQuery.message?.message_id;
+    const wizard = messageId === undefined ? undefined : wizards.get(messageId);
+    if (!wizard || wizard.userId !== ctx.from.id) {
+      return void (await ctx.answerCallbackQuery({ text: "This menu has expired. Run /new again." }));
+    }
+    const [, step, value] = ctx.callbackQuery.data.split(":");
+
+    if (step === "x") {
+      wizards.delete(messageId!);
+      await ctx.answerCallbackQuery();
+      return void (await ctx.deleteMessage().catch(() => ctx.editMessageText("Cancelled.")));
+    }
+    if (step === "a" && (value === "claude" || value === "codex")) {
+      wizard.agent = value;
+      await ctx.answerCallbackQuery();
+      if (cfg.projects.length === 1) return finish(ctx, messageId!, wizard, cfg.projects[0]!);
+      const keyboard = new InlineKeyboard();
+      cfg.projects.forEach((p, i) => {
+        keyboard.text(p.name, `new:p:${i}`);
+        if (i % 2 === 1) keyboard.row();
+      });
+      keyboard.row().text("Cancel", "new:x");
+      return void (await ctx.editMessageText(`${AGENTS[value].emoji} <b>${AGENTS[value].label}</b>. Which project?`, {
+        parse_mode: "HTML",
+        reply_markup: keyboard,
+      }));
+    }
+    if (step === "p" && wizard.agent) {
+      const project = cfg.projects[Number(value)];
+      await ctx.answerCallbackQuery();
+      if (project) return finish(ctx, messageId!, wizard, project);
+    }
+    await ctx.answerCallbackQuery({ text: "Unknown choice." });
+  });
+
+  async function finish(ctx: Context, menuId: number, wizard: Wizard, project: Project): Promise<void> {
+    wizards.delete(menuId);
+    const agent = wizard.agent!;
+    const a = AGENTS[agent];
+    const title = wizard.task ? clip(firstLine(wizard.task), 60) : `${a.label} · ${project.name}`;
+    let topicId: number;
+    try {
+      topicId = (await bot.api.createForumTopic(chatId!, clip(`${a.emoji} ${title}`, 128))).message_thread_id;
+    } catch (err) {
+      log.error("createForumTopic failed", String(err));
+      const rights = /not enough rights/i.test(String(err));
+      await ctx.editMessageText(
+        rights
+          ? "❌ I can't create threads here. Make me an admin with <b>Manage Topics</b> (group settings → Administrators), then run /new again."
+          : `❌ Could not create the thread: <code>${escapeHtml(String(err).slice(0, 300))}</code>`,
+        { parse_mode: "HTML" },
+      );
+      return;
+    }
+    manager.create(topicId, agent, project, title, !wizard.task);
+
+    await ctx.editMessageText(`${a.emoji} <b>${a.label}</b> on <b>${escapeHtml(project.name)}</b> → <a href="${topicLink(topicId)}">${escapeHtml(title)}</a>`, {
+      parse_mode: "HTML",
+      link_preview_options: { is_disabled: true },
+    });
+    const mode =
+      agent === "claude"
+        ? claudeBypass
+          ? "⚠️ full host access, no approval prompts"
+          : `permissions: ${escapeHtml(cfg.claude.permissionMode)}, I'll ask here when a tool needs approval`
+        : codexFull
+          ? "⚠️ full host access, no sandbox"
+          : `sandbox: ${escapeHtml(cfg.codex.sandboxMode)}, no approval prompts`;
+    await bot.api.sendMessage(
+      chatId!,
+      `${a.emoji} <b>${a.label}</b> in <code>${escapeHtml(project.path)}</code>\n` +
+        `🧠 ${escapeHtml(await models.label(agent, undefined))}\n<i>${mode}</i>` +
+        (wizard.task ? "" : "\n\nSend the first message to start."),
+      { message_thread_id: topicId, parse_mode: "HTML", reply_markup: new InlineKeyboard().text("🧠 Change model", "mdl:o") },
+    );
+    if (wizard.task) manager.send(topicId, wizard.task);
+  }
+
+  // --- buttons from running sessions ---------------------------------------------------
+  bot.callbackQuery(/^perm:/, async (ctx) => {
+    const ok = await permissions.answer(ctx.callbackQuery.data);
+    await ctx.answerCallbackQuery(ok ? undefined : { text: "This request is no longer pending." });
+  });
+
+  bot.callbackQuery(/^stop:\d+$/, async (ctx) => {
+    const stopped = await manager.stop(Number(ctx.callbackQuery.data.slice(5)));
+    await ctx.answerCallbackQuery({ text: stopped ? "Stopping…" : "Nothing is running." });
+  });
+
+  // --- conversation -------------------------------------------------------------------
+  bot.on("message:text", async (ctx) => {
+    const topicId = topicOf(ctx);
+    if (topicId === undefined) {
+      return void (await ctx.reply("Start a session with /new. Each session gets its own thread."));
+    }
+    const rec = store.get(topicId);
+    if (!rec) return void (await ctx.reply("This thread isn't linked to an agent. Start one with /new.", { message_thread_id: topicId }));
+    if (rec.closed) return void (await ctx.reply("This session has ended. Start a new one with /new.", { message_thread_id: topicId }));
+
+    if (rec.autoTitle) {
+      const title = clip(firstLine(ctx.msg.text), 60);
+      store.update(topicId, { title, autoTitle: false });
+      await bot.api
+        .editForumTopic(chatId!, topicId, { name: clip(`${AGENTS[rec.agent].emoji} ${title}`, 128) })
+        .catch((err) => log.warn("editForumTopic failed", String(err)));
+    }
+    manager.send(topicId, ctx.msg.text);
+  });
+
+  bot.on(["message:photo", "message:document", "message:voice", "message:video", "message:audio"], (ctx) =>
+    ctx.reply("Only text messages are supported for now.", { message_thread_id: topicOf(ctx) }),
+  );
+
+  bot.catch((err) => log.error(`update ${err.ctx.update.update_id} failed`, err.error));
+}
