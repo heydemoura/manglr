@@ -31,14 +31,14 @@ interface Call {
 /** The real handlers on a bot whose API calls are recorded instead of sent. */
 function harness() {
   const calls: Call[] = [];
-  const bot = new Bot("1:fake", { botInfo: { id: 1, is_bot: true, first_name: "bot", username: "medabot" } as any });
+  const bot = new Bot("1:fake", { botInfo: { id: 1, is_bot: true, first_name: "bot", username: "manglr" } as any });
   bot.api.config.use(async (_prev, method, payload) => {
     calls.push({ method, payload: payload as Record<string, any> });
     const result = method === "sendMessage" ? { message_id: 100 + calls.length, chat: CHAT, date: 0 } : true;
     return { ok: true, result } as any;
   });
 
-  const store = new SessionStore(mkdtempSync(path.join(tmpdir(), "medabot-test-")));
+  const store = new SessionStore(mkdtempSync(path.join(tmpdir(), "manglr-test-")));
   store.upsert({ topicId: TOPIC, agent: "claude", project: "p", cwd: "/tmp", title: "t" });
   const switched: (string | undefined)[] = [];
   const manager = {

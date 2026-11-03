@@ -7,7 +7,7 @@ import { GATEWAY_ENV_KEYS, loadConfig } from "../src/config.js";
 
 test("gateway settings, the bot token above all, are not inherited by agents", () => {
   const cwd = process.cwd();
-  process.chdir(mkdtempSync(path.join(tmpdir(), "medabot-cfg-"))); // no .env here
+  process.chdir(mkdtempSync(path.join(tmpdir(), "manglr-cfg-"))); // no .env here
   try {
     Object.assign(process.env, {
       TELEGRAM_BOT_TOKEN: "1:secret",

@@ -21,7 +21,7 @@ if ((kind !== "claude" && kind !== "codex") || !prompt) {
   console.error('usage: npm run smoke -- <claude|codex> "<prompt>" [folder]');
   process.exit(2);
 }
-const cwd = realpathSync(folder ? path.resolve(folder) : mkdtempSync(path.join(tmpdir(), "medabot-smoke-")));
+const cwd = realpathSync(folder ? path.resolve(folder) : mkdtempSync(path.join(tmpdir(), "manglr-smoke-")));
 const answer = (process.env.SMOKE_PERMISSION ?? "allow") as "allow" | "deny";
 console.log(`▶ ${kind} in ${cwd}`);
 

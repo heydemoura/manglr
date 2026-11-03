@@ -1,4 +1,4 @@
-# medabot-agents
+# manglr
 
 A Telegram gateway for Claude Code and Codex sessions running on this host.
 Each agent session lives in its own thread (forum topic) of a private Telegram
