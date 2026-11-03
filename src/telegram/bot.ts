@@ -275,9 +275,9 @@ export function registerHandlers(
     await bot.api.sendMessage(
       chatId!,
       `${a.emoji} <b>${a.label}</b> in <code>${escapeHtml(project.path)}</code>\n` +
-        `🧠 ${escapeHtml(await models.label(agent, undefined))}\n<i>${mode}</i>` +
+        `🧠 ${escapeHtml(await models.defaultName(agent))} <i>(default, /model to switch)</i>\n<i>${mode}</i>` +
         (wizard.task ? "" : "\n\nSend the first message to start."),
-      { message_thread_id: topicId, parse_mode: "HTML", reply_markup: new InlineKeyboard().text("🧠 Change model", "mdl:o") },
+      { message_thread_id: topicId, parse_mode: "HTML" },
     );
     if (wizard.task) manager.send(topicId, wizard.task);
   }

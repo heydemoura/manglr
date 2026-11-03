@@ -49,6 +49,12 @@ export class ModelCatalog {
     return value ?? "Default";
   }
 
+  /** What "Default" resolves to on this host, e.g. "Opus 5.5" or "gpt-6.1-sol". */
+  async defaultName(agent: AgentKind): Promise<string> {
+    const def = (await this.list(agent)).find((m) => m.value === "");
+    return def?.description ?? "the agent's default model";
+  }
+
   private defaultChoice(agent: AgentKind, description?: string): ModelChoice {
     const env = agent === "claude" ? this.cfg.claude.model : this.cfg.codex.model;
     return { value: "", label: "Default", description: env ?? description };

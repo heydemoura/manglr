@@ -46,7 +46,7 @@ Requirements: Node 22+, a logged-in Claude Code (`claude`) and Codex (`codex log
 |---|---|
 | `/new [task]` | Pick the agent; opens a thread. With a task it starts right away, otherwise the first message in the thread starts it (and names the thread). |
 | reply in a thread | Goes to that session. While it works: Claude folds it into the running turn, Codex queues it for the next turn. |
-| `/model` or 🧠 | Switch this thread's model from a button menu (also on the thread's first message and on `/status`). |
+| `/model` or 🧠 | New threads use each agent's default model on this host. Switch a thread's model from a button menu (also on `/status`). |
 | `/stop` or ⏹ | Interrupts the running turn; the session continues with your next message. |
 | `/end` | Ends the session and closes the thread. The transcript stays on disk. |
 | `/status` | Agent, folder, session id, model, permission/sandbox mode. |
