@@ -1,6 +1,7 @@
 # manglr
 
-A Telegram gateway for Claude Code and Codex sessions running on this host.
+A Telegram gateway for Claude Code and Codex sessions running on this host,
+or on [other computers](#other-computers) over SSH.
 Each agent session lives in its own thread (forum topic) of a private Telegram
 group: the agent's replies and progress show up in the thread, and your replies
 in the thread become its next input.
@@ -79,6 +80,64 @@ lacks the thread's effort puts it back on *Default*.
 the agents keep their transcripts (`~/.claude/projects`, `~/.codex/sessions`).
 After a restart, the next message in a thread resumes its session.
 
+## Other computers
+
+The gateway can also run agents on other computers. With a hosts file,
+`/new` first asks which computer, and the thread's agent runs there: with that
+computer's files, its `claude` / `codex` logins and settings. Thread names
+start with the host (`🟠 bazzite: fix the tests`) and `/status` shows it.
+
+```
+Telegram ⇄ gateway ──ssh──▶ runner on bazzite ──▶ Claude / Codex
+                    └─ssh──▶ runner on debian  ──▶ …
+```
+
+The gateway starts a small **runner** on each host over SSH (`node
+dist/runner.js`) and talks to it on stdin/stdout: no open ports, no extra
+credentials beyond your SSH key. One connection per host, opened on first use
+and shared by its sessions. Permission buttons, live progress, `/model`,
+`/effort` and `/stop` work the same; the model menus list what that host's
+agents offer.
+
+**Each host needs:** key-based SSH from the gateway (no password prompt; the
+gateway uses `BatchMode`), Node 22+, a logged-in `claude` and/or `codex`, and
+manglr built where the runner command expects it:
+
+```sh
+# on the host
+git clone git@github.com:heydemoura/manglr.git ~/manglr
+cd ~/manglr && npm ci && npm run build
+```
+
+**On the gateway**, list the hosts in `hosts.json` (`HOSTS_FILE`):
+
+```json
+[
+  { "name": "bazzite", "ssh": "bazzite@192.168.0.146" },
+  { "name": "debian", "ssh": "debian", "cwd": "~/Code" }
+]
+```
+
+| field | |
+|---|---|
+| `name` | Shown in Telegram and stored with each session (letters, digits, `.` `_` `-`). |
+| `ssh` | SSH destination: `user@host` or an alias from `~/.ssh/config`. Default: `name`. |
+| `cwd` | Where sessions start on that host; `~` is the remote home. Default `~`. |
+| `command` | Starts the runner. Default `cd ~/manglr && exec node dist/runner.js`. Override it when node isn't on the non-interactive SSH `PATH` (nvm, Homebrew), e.g. `"bash -lc 'cd ~/manglr && exec node dist/runner.js'"`. |
+| `claudePath`, `codexPath` | Agent binaries on that host, when the SDKs shouldn't pick their own. |
+
+Check a host without Telegram: `SMOKE_HOST=bazzite npm run smoke -- claude "say hi"`.
+
+**When the connection drops** (host asleep, network), a running turn ends
+with an error in its thread. The next message reconnects and resumes the
+session from the transcript on that host. The runner ends its sessions when
+the gateway disconnects, so a turn doesn't survive a dropped link.
+
+The permission and sandbox settings (`CLAUDE_PERMISSION_MODE`,
+`CODEX_SANDBOX`, …) and default model/effort come from the gateway's `.env`
+and apply on every host. Keep runner and gateway on the same manglr version:
+the handshake refuses a protocol mismatch.
+
 ## Security
 
 The bot can run commands on this host. It ignores every update that isn't
@@ -87,7 +146,8 @@ from `TELEGRAM_ALLOWED_USER_IDS` inside `TELEGRAM_CHAT_ID`. Sessions start in
 folder to work in. With the default permission settings Claude asks before
 touching anything outside that folder; with `CLAUDE_PERMISSION_MODE=bypassPermissions`
 and `CODEX_SANDBOX=danger-full-access` both agents have full access to the host,
-so whoever controls your Telegram account controls this machine: turn on
+so whoever controls your Telegram account controls this machine (and every
+host in the hosts file, with the gateway's SSH key): turn on
 Telegram's two-step verification. Keep `.env` private; anyone with the token can
 impersonate the bot, not you.
 
@@ -115,6 +175,12 @@ src/config.ts             .env
 src/store.ts              topic ↔ session records (data/sessions.json)
 src/sessions.ts           live sessions per topic, lazy resume, per-thread model
 src/models.ts             model menu entries, read from each agent
+src/hosts.ts              hosts file (remote computers)
+src/runner.ts             runner entry point: started over SSH on a remote host
+src/remote/protocol.ts    hub ⇄ runner messages (JSON lines)
+src/remote/host.ts        hub side: SSH connection per host, RemoteSession
+src/remote/runner-core.ts runner side: hosts the agent sessions, relays events
+src/remote/registry.ts    configured hosts, their sessions and model menus
 src/agents/claude.ts      Agent SDK: streaming-input query(), canUseTool, interrupt, resume
 src/agents/codex.ts       Codex SDK: thread per topic, streamed turns, abort, resume
 src/telegram/bot.ts       commands, /new menu, routing, buttons
@@ -129,3 +195,4 @@ src/telegram/format.ts    Markdown → Telegram HTML, 4096-char chunking
 - Claude's interactive question picker (`AskUserQuestion`) is disabled; Claude asks in plain text instead.
 - Approvals for Codex (would need `codex app-server` instead of the SDK).
 - Running as a service (launchd / systemd unit).
+- Remote turns that survive a dropped SSH connection (would need the runner as a long-lived service).

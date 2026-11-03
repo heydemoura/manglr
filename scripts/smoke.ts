@@ -8,6 +8,9 @@
  * Without a folder it works in a fresh temp directory. SMOKE_RESUME=<session id>
  * resumes a session; SMOKE_MODEL=<model> picks the model; SMOKE_EFFORT=<level> the effort; SMOKE_PERMISSION=deny
  * denies every permission request.
+ *
+ * SMOKE_HOST=<name> runs it on that host from hosts.json instead, through its
+ * runner over SSH (the folder is then a path on that host, default ~).
  */
 import { mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -15,15 +18,25 @@ import path from "node:path";
 import { ClaudeSession } from "../src/agents/claude.js";
 import { CodexSession } from "../src/agents/codex.js";
 import type { AgentEvents, AgentSession } from "../src/agents/types.js";
+import { loadHosts } from "../src/hosts.js";
+import { RemoteHost } from "../src/remote/host.js";
 
 const [kind, prompt, folder] = process.argv.slice(2);
 if ((kind !== "claude" && kind !== "codex") || !prompt) {
   console.error('usage: npm run smoke -- <claude|codex> "<prompt>" [folder]');
   process.exit(2);
 }
-const cwd = realpathSync(folder ? path.resolve(folder) : mkdtempSync(path.join(tmpdir(), "manglr-smoke-")));
+const remoteName = process.env.SMOKE_HOST;
+const remoteCfg = remoteName ? loadHosts(path.resolve("hosts.json")).find((h) => h.name === remoteName) : undefined;
+if (remoteName && !remoteCfg) {
+  console.error(`no host "${remoteName}" in hosts.json`);
+  process.exit(2);
+}
+const cwd = remoteCfg
+  ? (folder ?? remoteCfg.cwd)
+  : realpathSync(folder ? path.resolve(folder) : mkdtempSync(path.join(tmpdir(), "manglr-smoke-")));
 const answer = (process.env.SMOKE_PERMISSION ?? "allow") as "allow" | "deny";
-console.log(`▶ ${kind} in ${cwd}`);
+console.log(`▶ ${kind} in ${cwd}${remoteCfg ? ` on ${remoteCfg.name}` : ""}`);
 
 let done!: () => void;
 const finished = new Promise<void>((r) => (done = r));
@@ -44,11 +57,18 @@ const events: AgentEvents = {
 };
 
 const init = { cwd, resume: process.env.SMOKE_RESUME, model: process.env.SMOKE_MODEL, effort: process.env.SMOKE_EFFORT };
-const session: AgentSession =
-  kind === "claude"
+const remote = remoteCfg ? new RemoteHost(remoteCfg) : undefined;
+const session: AgentSession = remote
+  ? remote.session(
+      { kind, cwd, claude: { permissionMode: "default" }, codex: { sandboxMode: "workspace-write", networkAccess: false } },
+      init,
+      events,
+    )
+  : kind === "claude"
     ? new ClaudeSession({ permissionMode: "default" }, init, events)
     : new CodexSession({ sandboxMode: "workspace-write", networkAccess: false }, init, events);
 
 session.send(prompt);
 await finished;
 await session.close();
+remote?.shutdown();

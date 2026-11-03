@@ -2,6 +2,7 @@ import { autoRetry } from "@grammyjs/auto-retry";
 import { Bot, GrammyError } from "grammy";
 import { loadConfig, type Config } from "./config.js";
 import { ModelCatalog } from "./models.js";
+import { HostRegistry } from "./remote/registry.js";
 import { SessionManager } from "./sessions.js";
 import { SessionStore } from "./store.js";
 import { COMMANDS, registerHandlers } from "./telegram/bot.js";
@@ -20,9 +21,10 @@ bot.api.config.use(autoRetry({ maxRetryAttempts: 5, maxDelaySeconds: 60 }));
 
 const store = new SessionStore(cfg.dataDir);
 const permissions = new PermissionBroker(bot.api);
-const manager = new SessionManager(cfg, bot.api, store, permissions);
+const hosts = new HostRegistry(cfg);
+const manager = new SessionManager(cfg, bot.api, store, permissions, hosts);
 const models = new ModelCatalog(cfg);
-registerHandlers(bot, cfg, store, manager, permissions, models);
+registerHandlers(bot, cfg, store, manager, permissions, models, hosts);
 
 if (cfg.setupMode) {
   log.warn(
@@ -45,6 +47,7 @@ if (cfg.setupMode) {
   void models.list("claude"); // warm the model menu (starts Claude Code once, no prompt)
   void models.list("codex");
   log.info(`Serving "${chat.title}" for ${cfg.telegram.allowedUserIds.size} user(s); sessions start in ${cfg.workdir.path}`);
+  if (cfg.hosts.length) log.info(`Remote hosts: ${cfg.hosts.map((h) => `${h.name} (${h.ssh})`).join(", ")}`);
 }
 
 let stopping = false;

@@ -3,6 +3,7 @@ import { ClaudeSession } from "./agents/claude.js";
 import { CodexSession } from "./agents/codex.js";
 import type { AgentKind, AgentSession } from "./agents/types.js";
 import type { Config, Project } from "./config.js";
+import type { HostRegistry } from "./remote/registry.js";
 import type { SessionRecord, SessionStore } from "./store.js";
 import type { PermissionBroker } from "./telegram/permissions.js";
 import { TopicUI } from "./telegram/topic-ui.js";
@@ -26,10 +27,11 @@ export class SessionManager {
     private readonly api: Api,
     private readonly store: SessionStore,
     private readonly permissions: PermissionBroker,
+    private readonly hosts?: HostRegistry,
   ) {}
 
-  create(topicId: number, agent: AgentKind, project: Project, title: string, autoTitle: boolean): SessionRecord {
-    return this.store.upsert({ topicId, agent, project: project.name, cwd: project.path, title, autoTitle });
+  create(topicId: number, agent: AgentKind, project: Project, title: string, autoTitle: boolean, host?: string): SessionRecord {
+    return this.store.upsert({ topicId, agent, host, project: project.name, cwd: project.path, title, autoTitle });
   }
 
   isBusy(topicId: number): boolean {
@@ -88,6 +90,7 @@ export class SessionManager {
       }),
     );
     this.live.clear();
+    this.hosts?.shutdown();
   }
 
   private ensure(topicId: number): Live | undefined {
@@ -100,17 +103,32 @@ export class SessionManager {
       this.store.update(topicId, { sessionId });
     });
     const init = { cwd: record.cwd, resume: record.sessionId, model: this.effectiveModel(record), effort: this.effectiveEffort(record) };
-    const session: AgentSession =
-      record.agent === "claude" ? new ClaudeSession(this.cfg.claude, init, ui) : new CodexSession(this.cfg.codex, init, ui);
+    let session: AgentSession;
+    try {
+      session = record.host
+        ? this.remote(record.host).session(record.host, record.agent, init, ui)
+        : record.agent === "claude"
+          ? new ClaudeSession(this.cfg.claude, init, ui)
+          : new CodexSession(this.cfg.codex, init, ui);
+    } catch (err) {
+      ui.dispose();
+      throw err;
+    }
     const live = { session, ui };
     this.live.set(topicId, live);
     log.info(
       `session for topic ${topicId}: ${record.agent} in ${record.cwd}` +
+        (record.host ? ` on ${record.host}` : "") +
         (init.model ? ` with ${init.model}` : "") +
         (init.effort ? ` at ${init.effort} effort` : "") +
         (record.sessionId ? ` (resuming ${record.sessionId})` : ""),
     );
     return live;
+  }
+
+  private remote(host: string): HostRegistry {
+    if (!this.hosts) throw new Error(`host "${host}" is not in the hosts file anymore`);
+    return this.hosts;
   }
 
   /** The session's own pick, else the env default, else undefined (the agent's default). */

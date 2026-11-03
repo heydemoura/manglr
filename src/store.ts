@@ -6,6 +6,8 @@ import type { AgentKind } from "./agents/types.js";
 export interface SessionRecord {
   topicId: number;
   agent: AgentKind;
+  /** Remote host (hosts file) the agent runs on; unset: this one. */
+  host?: string;
   project: string;
   cwd: string;
   title: string;

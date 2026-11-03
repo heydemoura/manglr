@@ -1,0 +1,4 @@
+[
+  { "name": "bazzite", "ssh": "bazzite@192.168.0.146" },
+  { "name": "debian", "ssh": "heyde@192.168.0.130", "cwd": "~/Code" }
+]

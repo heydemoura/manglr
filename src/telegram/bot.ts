@@ -1,7 +1,9 @@
+import { hostname } from "node:os";
 import { Bot, InlineKeyboard, type Context } from "grammy";
 import { AGENTS, type AgentKind } from "../agents/types.js";
 import type { Config, Project } from "../config.js";
 import type { ModelCatalog } from "../models.js";
+import type { HostDirectory } from "../remote/registry.js";
 import type { SessionManager } from "../sessions.js";
 import type { SessionRecord, SessionStore } from "../store.js";
 import { log } from "../util/log.js";
@@ -21,6 +23,8 @@ export const COMMANDS = [
 
 interface Wizard {
   task?: string;
+  /** Remote host picked; unset: this one. */
+  host?: string;
   agent?: AgentKind;
   userId: number;
 }
@@ -41,8 +45,16 @@ export function registerHandlers(
   manager: SessionManager,
   permissions: PermissionBroker,
   models: ModelCatalog,
+  hosts?: HostDirectory,
 ): void {
   const chatId = cfg.telegram.chatId;
+  const remoteHosts = hosts?.names() ?? [];
+  const localName = hostname().split(".")[0] || "local";
+  /** The model menu of the host a session runs on. */
+  const catalog = (host: string | undefined) => (host && hosts ? hosts.catalog(host) : models);
+  const hostLabel = (host: string | undefined) => host ?? localName;
+  const topicName = (agent: AgentKind, title: string, host: string | undefined) =>
+    clip(`${AGENTS[agent].emoji} ${host ? `${host}: ` : ""}${title}`, 128);
   const wizards = new Map<number, Wizard>();
   const claudeBypass = cfg.claude.permissionMode === "bypassPermissions";
   const codexFull = cfg.codex.sandboxMode === "danger-full-access";
@@ -79,7 +91,9 @@ export function registerHandlers(
     ctx.reply(
       [
         "<b>Agent gateway</b>",
-        "• /new [task]: pick Claude or Codex; a new thread opens for the session.",
+        remoteHosts.length
+          ? "• /new [task]: pick the computer, then Claude or Codex; a new thread opens for the session."
+          : "• /new [task]: pick Claude or Codex; a new thread opens for the session.",
         "• Reply in a thread to talk to its agent. Messages sent while it works are passed along.",
         "• Tool permission requests (Claude) show up with Allow / Deny buttons.",
         "• /model switches the model of a thread's session, /effort its reasoning effort.",
@@ -89,13 +103,30 @@ export function registerHandlers(
     ),
   );
 
-  bot.command("new", async (ctx) => {
-    const task = ctx.match.trim() || undefined;
+  const newPrompt = (task: string | undefined, question: string) =>
+    task ? `New session for:\n<i>${escapeHtml(clip(task, 300))}</i>\n\n${question}` : `New session. ${question}`;
+
+  function agentKeyboard(): InlineKeyboard {
     const keyboard = new InlineKeyboard();
     for (const [kind, a] of Object.entries(AGENTS)) keyboard.text(`${a.emoji} ${a.label}`, `new:a:${kind}`);
-    keyboard.row().text("Cancel", "new:x");
-    const prompt = task ? `New session for:\n<i>${escapeHtml(clip(task, 300))}</i>\n\nWhich agent?` : "New session. Which agent?";
-    const msg = await ctx.reply(prompt, { parse_mode: "HTML", reply_markup: keyboard, message_thread_id: topicOf(ctx) });
+    return keyboard.row().text("Cancel", "new:x");
+  }
+
+  function hostKeyboard(): InlineKeyboard {
+    const keyboard = new InlineKeyboard().text(`🏠 ${localName}`, "new:h:");
+    let col = 1;
+    for (const name of remoteHosts) {
+      if (col++ % 2 === 0) keyboard.row();
+      keyboard.text(`🖥 ${name}`, `new:h:${name}`);
+    }
+    return keyboard.row().text("Cancel", "new:x");
+  }
+
+  bot.command("new", async (ctx) => {
+    const task = ctx.match.trim() || undefined;
+    // With remote hosts, the computer comes first; otherwise straight to the agent.
+    const [question, keyboard] = remoteHosts.length ? ["Which computer?", hostKeyboard()] : ["Which agent?", agentKeyboard()];
+    const msg = await ctx.reply(newPrompt(task, question), { parse_mode: "HTML", reply_markup: keyboard, message_thread_id: topicOf(ctx) });
     wizards.set(msg.message_id, { task, userId: ctx.from!.id });
   });
 
@@ -104,7 +135,8 @@ export function registerHandlers(
     if (open.length === 0) return void (await ctx.reply("No open sessions. Start one with /new.", { message_thread_id: topicOf(ctx) }));
     const lines = open.map((r) => {
       const busy = manager.isBusy(r.topicId) ? " · ⏳ working" : "";
-      return `${AGENTS[r.agent].emoji} <a href="${topicLink(r.topicId)}">${escapeHtml(r.title)}</a> · ${escapeHtml(r.project)}${busy}`;
+      const where = r.host ? `${escapeHtml(r.host)}:${escapeHtml(r.project)}` : escapeHtml(r.project);
+      return `${AGENTS[r.agent].emoji} <a href="${topicLink(r.topicId)}">${escapeHtml(r.title)}</a> · ${where}${busy}`;
     });
     await ctx.reply(lines.join("\n"), { parse_mode: "HTML", message_thread_id: topicOf(ctx), link_preview_options: { is_disabled: true } });
   });
@@ -122,7 +154,7 @@ export function registerHandlers(
     if (topicId === undefined || !rec || rec.closed) return void (await ctx.reply("Use /end inside an open session thread.", { message_thread_id: topicId }));
     await manager.end(topicId);
     await ctx.reply(
-      `Session ended. Its transcript stays on the host${rec.sessionId ? ` (<code>${escapeHtml(rec.sessionId)}</code>)` : ""}.`,
+      `Session ended. Its transcript stays on ${escapeHtml(hostLabel(rec.host))}${rec.sessionId ? ` (<code>${escapeHtml(rec.sessionId)}</code>)` : ""}.`,
       { parse_mode: "HTML", message_thread_id: topicId },
     );
     await bot.api.closeForumTopic(chatId!, topicId).catch((err) => log.warn("closeForumTopic failed", String(err)));
@@ -134,10 +166,11 @@ export function registerHandlers(
     if (!rec) return void (await ctx.reply("Use /status inside a session thread.", { message_thread_id: topicId }));
     const lines = [
       `${AGENTS[rec.agent].emoji} <b>${AGENTS[rec.agent].label}</b> · ${escapeHtml(rec.project)}`,
+      ...(rec.host || remoteHosts.length ? [`host: ${escapeHtml(hostLabel(rec.host))}`] : []),
       `folder: <code>${escapeHtml(rec.cwd)}</code>`,
       `session: <code>${escapeHtml(rec.sessionId ?? "not started")}</code>`,
-      `model: ${escapeHtml(await models.label(rec.agent, rec.model))}`,
-      `effort: ${escapeHtml(await models.effortLabel(rec.agent, rec.model, rec.effort))}`,
+      `model: ${escapeHtml(await catalog(rec.host).label(rec.agent, rec.model))}`,
+      `effort: ${escapeHtml(await catalog(rec.host).effortLabel(rec.agent, rec.model, rec.effort))}`,
       rec.agent === "claude"
         ? `permissions: ${escapeHtml(cfg.claude.permissionMode)}${claudeBypass ? " (full access, no prompts)" : " (asks here when needed)"}`
         : `sandbox: ${escapeHtml(cfg.codex.sandboxMode)}${codexFull ? " (full access)" : `, network ${cfg.codex.networkAccess ? "on" : "off"}`}`,
@@ -164,7 +197,7 @@ export function registerHandlers(
     const current = rec.model ?? "";
     const keyboard = new InlineKeyboard();
     let col = 0;
-    for (const m of await models.list(rec.agent)) {
+    for (const m of await catalog(rec.host).list(rec.agent)) {
       const data = `mdl:s:${m.value}`;
       if (Buffer.byteLength(data) > 64) continue; // Telegram's callback data limit
       keyboard.text(`${m.value === current ? "✓ " : ""}${m.label}`, data);
@@ -175,7 +208,7 @@ export function registerHandlers(
     const when = rec.agent === "claude" ? "Claude switches from its next response, also mid-turn." : "Codex switches from its next turn.";
     const text =
       `🧠 <b>Model</b> · ${a.emoji} ${a.label}\n` +
-      `Now: <b>${escapeHtml(await models.label(rec.agent, rec.model))}</b>\n` +
+      `Now: <b>${escapeHtml(await catalog(rec.host).label(rec.agent, rec.model))}</b>\n` +
       `<i>${when}</i>`;
     return { text, keyboard };
   }
@@ -199,6 +232,7 @@ export function registerHandlers(
     }
     if (data.startsWith("mdl:s:")) {
       const value = data.slice("mdl:s:".length);
+      const models = catalog(rec.host);
       const choice = (await models.list(rec.agent)).find((m) => m.value === value);
       if (!choice) return void (await ctx.answerCallbackQuery({ text: "That model is no longer offered. Run /model again." }));
       if (value === (rec.model ?? "")) {
@@ -239,6 +273,7 @@ export function registerHandlers(
     const current = rec.effort ?? "";
     const keyboard = new InlineKeyboard();
     let col = 0;
+    const models = catalog(rec.host);
     for (const e of await models.efforts(rec.agent, rec.model)) {
       keyboard.text(`${e.value === current ? "✓ " : ""}${e.label}`, `eff:s:${e.value}`);
       if (++col % 3 === 0) keyboard.row();
@@ -272,7 +307,7 @@ export function registerHandlers(
     }
     if (data.startsWith("eff:s:")) {
       const value = data.slice("eff:s:".length);
-      const choice = (await models.efforts(rec.agent, rec.model)).find((e) => e.value === value);
+      const choice = (await catalog(rec.host).efforts(rec.agent, rec.model)).find((e) => e.value === value);
       if (!choice) return void (await ctx.answerCallbackQuery({ text: "This model doesn't offer that effort. Run /effort again." }));
       if (value === (rec.effort ?? "")) {
         return void (await ctx.answerCallbackQuery({ text: `Already on ${choice.label}.` }));
@@ -305,10 +340,17 @@ export function registerHandlers(
       await ctx.answerCallbackQuery();
       return void (await ctx.deleteMessage().catch(() => ctx.editMessageText("Cancelled.")));
     }
+    if (step === "h" && value !== undefined && (value === "" || remoteHosts.includes(value))) {
+      wizard.host = value || undefined;
+      await ctx.answerCallbackQuery();
+      const on = `on <b>${escapeHtml(hostLabel(wizard.host))}</b>. Which agent?`;
+      return void (await ctx.editMessageText(newPrompt(wizard.task, on), { parse_mode: "HTML", reply_markup: agentKeyboard() }));
+    }
     if (step === "a" && (value === "claude" || value === "codex")) {
       wizard.agent = value;
       await ctx.answerCallbackQuery();
-      return finish(ctx, messageId!, wizard, cfg.workdir);
+      const project = wizard.host ? { name: hosts!.config(wizard.host).cwd, path: hosts!.config(wizard.host).cwd } : cfg.workdir;
+      return finish(ctx, messageId!, wizard, project);
     }
     await ctx.answerCallbackQuery({ text: "Unknown choice." });
   });
@@ -320,7 +362,7 @@ export function registerHandlers(
     const title = wizard.task ? clip(firstLine(wizard.task), 60) : `New ${a.label} session`;
     let topicId: number;
     try {
-      topicId = (await bot.api.createForumTopic(chatId!, clip(`${a.emoji} ${title}`, 128))).message_thread_id;
+      topicId = (await bot.api.createForumTopic(chatId!, topicName(agent, title, wizard.host))).message_thread_id;
     } catch (err) {
       log.error("createForumTopic failed", String(err));
       const rights = /not enough rights/i.test(String(err));
@@ -332,9 +374,11 @@ export function registerHandlers(
       );
       return;
     }
-    manager.create(topicId, agent, project, title, !wizard.task);
+    manager.create(topicId, agent, project, title, !wizard.task, wizard.host);
+    const models = catalog(wizard.host);
+    const on = wizard.host ? ` on <b>${escapeHtml(wizard.host)}</b>` : "";
 
-    await ctx.editMessageText(`${a.emoji} <b>${a.label}</b> → <a href="${topicLink(topicId)}">${escapeHtml(title)}</a>`, {
+    await ctx.editMessageText(`${a.emoji} <b>${a.label}</b>${on} → <a href="${topicLink(topicId)}">${escapeHtml(title)}</a>`, {
       parse_mode: "HTML",
       link_preview_options: { is_disabled: true },
     });
@@ -348,13 +392,26 @@ export function registerHandlers(
           : `sandbox: ${escapeHtml(cfg.codex.sandboxMode)}, no approval prompts`;
     await bot.api.sendMessage(
       chatId!,
-      `${a.emoji} <b>${a.label}</b> in <code>${escapeHtml(project.path)}</code>\n` +
+      `${a.emoji} <b>${a.label}</b>${on} in <code>${escapeHtml(project.path)}</code>\n` +
         `🧠 ${escapeHtml(await models.defaultName(agent))} <i>(default, /model to switch)</i>\n` +
         `⚡ ${escapeHtml(await models.effortLabel(agent, undefined, undefined))} effort <i>(/effort to switch)</i>\n<i>${mode}</i>` +
         (wizard.task ? "" : "\n\nSend the first message to start."),
       { message_thread_id: topicId, parse_mode: "HTML" },
     );
-    if (wizard.task) manager.send(topicId, wizard.task);
+    if (wizard.task) await sendTo(topicId, wizard.task);
+  }
+
+  /** Pass a message to a session; a session that can't start says why in its thread. */
+  async function sendTo(topicId: number, text: string): Promise<void> {
+    try {
+      manager.send(topicId, text);
+    } catch (err) {
+      log.warn(`topic ${topicId}: send failed`, String(err));
+      await bot.api.sendMessage(chatId!, `❌ ${escapeHtml(err instanceof Error ? err.message : String(err))}`, {
+        message_thread_id: topicId,
+        parse_mode: "HTML",
+      });
+    }
   }
 
   // --- buttons from running sessions ---------------------------------------------------
@@ -382,10 +439,10 @@ export function registerHandlers(
       const title = clip(firstLine(ctx.msg.text), 60);
       store.update(topicId, { title, autoTitle: false });
       await bot.api
-        .editForumTopic(chatId!, topicId, { name: clip(`${AGENTS[rec.agent].emoji} ${title}`, 128) })
+        .editForumTopic(chatId!, topicId, { name: topicName(rec.agent, title, rec.host) })
         .catch((err) => log.warn("editForumTopic failed", String(err)));
     }
-    manager.send(topicId, ctx.msg.text);
+    await sendTo(topicId, ctx.msg.text);
   });
 
   bot.on(["message:photo", "message:document", "message:voice", "message:video", "message:audio"], (ctx) =>
