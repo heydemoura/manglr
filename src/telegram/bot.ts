@@ -12,6 +12,7 @@ export const COMMANDS = [
   { command: "new", description: "Start an agent session in a new thread" },
   { command: "list", description: "Open sessions" },
   { command: "model", description: "Switch this thread's model" },
+  { command: "effort", description: "Switch this thread's reasoning effort" },
   { command: "stop", description: "Stop the running turn (in a thread)" },
   { command: "end", description: "End this thread's session" },
   { command: "status", description: "Session details (in a thread)" },
@@ -81,7 +82,7 @@ export function registerHandlers(
         "• /new [task]: pick Claude or Codex; a new thread opens for the session.",
         "• Reply in a thread to talk to its agent. Messages sent while it works are passed along.",
         "• Tool permission requests (Claude) show up with Allow / Deny buttons.",
-        "• /model switches the model of a thread's session.",
+        "• /model switches the model of a thread's session, /effort its reasoning effort.",
         "• /stop stops the current turn, /end ends the session, /status shows details, /list lists sessions.",
       ].join("\n"),
       { parse_mode: "HTML", message_thread_id: topicOf(ctx) },
@@ -136,6 +137,7 @@ export function registerHandlers(
       `folder: <code>${escapeHtml(rec.cwd)}</code>`,
       `session: <code>${escapeHtml(rec.sessionId ?? "not started")}</code>`,
       `model: ${escapeHtml(await models.label(rec.agent, rec.model))}`,
+      `effort: ${escapeHtml(await models.effortLabel(rec.agent, rec.model, rec.effort))}`,
       rec.agent === "claude"
         ? `permissions: ${escapeHtml(cfg.claude.permissionMode)}${claudeBypass ? " (full access, no prompts)" : " (asks here when needed)"}`
         : `sandbox: ${escapeHtml(cfg.codex.sandboxMode)}${codexFull ? " (full access)" : `, network ${cfg.codex.networkAccess ? "on" : "off"}`}`,
@@ -144,7 +146,7 @@ export function registerHandlers(
     await ctx.reply(lines.join("\n"), {
       parse_mode: "HTML",
       message_thread_id: topicId,
-      reply_markup: rec.closed ? undefined : new InlineKeyboard().text("🧠 Change model", "mdl:o"),
+      reply_markup: rec.closed ? undefined : new InlineKeyboard().text("🧠 Change model", "mdl:o").text("⚡ Change effort", "eff:o"),
     });
   });
 
@@ -202,8 +204,11 @@ export function registerHandlers(
       if (value === (rec.model ?? "")) {
         return void (await ctx.answerCallbackQuery({ text: `Already on ${choice.label}.` }));
       }
+      // An effort the new model doesn't take goes back to the default.
+      const dropEffort = rec.effort !== undefined && !(await models.supportsEffort(rec.agent, value || undefined, rec.effort));
       try {
         await manager.setModel(topicId, value || undefined);
+        if (dropEffort) await manager.setEffort(topicId, undefined);
       } catch (err) {
         log.warn("setModel failed", String(err));
         return void (await ctx.answerCallbackQuery({ text: `Could not switch: ${String(err).slice(0, 150)}` }));
@@ -212,7 +217,76 @@ export function registerHandlers(
       const label = await models.label(rec.agent, value || undefined);
       const when = rec.agent === "claude" ? "from Claude's next response" : manager.isBusy(topicId) ? "from Codex's next turn" : "from the next message";
       log.info(`topic ${topicId}: model → ${value || "default"}`);
-      return void (await ctx.editMessageText(`🧠 Model → <b>${escapeHtml(label)}</b>\n<i>Applies ${when}.</i>`, { parse_mode: "HTML" }));
+      const effortNote = dropEffort
+        ? `\n⚡ ${escapeHtml(choice.label)} has no <b>${escapeHtml(rec.effort!)}</b> effort: back to ${escapeHtml(await models.effortLabel(rec.agent, value || undefined, undefined))}.`
+        : "";
+      return void (await ctx.editMessageText(`🧠 Model → <b>${escapeHtml(label)}</b>\n<i>Applies ${when}.</i>${effortNote}`, { parse_mode: "HTML" }));
+    }
+    await ctx.answerCallbackQuery({ text: "Unknown choice." });
+  });
+
+  bot.command("effort", async (ctx) => {
+    const topicId = topicOf(ctx);
+    const rec = topicId === undefined ? undefined : store.get(topicId);
+    if (!rec || rec.closed) return void (await ctx.reply("Use /effort inside an open session thread.", { message_thread_id: topicId }));
+    const menu = await effortMenu(rec);
+    await ctx.reply(menu.text, { parse_mode: "HTML", message_thread_id: topicId, reply_markup: menu.keyboard });
+  });
+
+  // --- effort picker ------------------------------------------------------------------
+  async function effortMenu(rec: SessionRecord): Promise<{ text: string; keyboard: InlineKeyboard }> {
+    const a = AGENTS[rec.agent];
+    const current = rec.effort ?? "";
+    const keyboard = new InlineKeyboard();
+    let col = 0;
+    for (const e of await models.efforts(rec.agent, rec.model)) {
+      keyboard.text(`${e.value === current ? "✓ " : ""}${e.label}`, `eff:s:${e.value}`);
+      if (++col % 3 === 0) keyboard.row();
+    }
+    if (col % 3 !== 0) keyboard.row();
+    keyboard.text("Close", "eff:x");
+    const when = rec.agent === "claude" ? "Claude switches from its next response, also mid-turn." : "Codex switches from its next turn.";
+    const text =
+      `⚡ <b>Effort</b> · ${a.emoji} ${a.label} · ${escapeHtml(await models.label(rec.agent, rec.model))}\n` +
+      `Now: <b>${escapeHtml(await models.effortLabel(rec.agent, rec.model, rec.effort))}</b>\n` +
+      `<i>${when}</i>`;
+    return { text, keyboard };
+  }
+
+  bot.callbackQuery(/^eff:/, async (ctx) => {
+    const topicId = topicOf(ctx);
+    const rec = topicId === undefined ? undefined : store.get(topicId);
+    if (topicId === undefined || !rec || rec.closed) {
+      return void (await ctx.answerCallbackQuery({ text: "This session has ended." }));
+    }
+    const data = ctx.callbackQuery.data;
+
+    if (data === "eff:x") {
+      await ctx.answerCallbackQuery();
+      return void (await ctx.deleteMessage().catch(() => ctx.editMessageReplyMarkup()));
+    }
+    if (data === "eff:o") {
+      await ctx.answerCallbackQuery();
+      const menu = await effortMenu(rec);
+      return void (await ctx.reply(menu.text, { parse_mode: "HTML", message_thread_id: topicId, reply_markup: menu.keyboard }));
+    }
+    if (data.startsWith("eff:s:")) {
+      const value = data.slice("eff:s:".length);
+      const choice = (await models.efforts(rec.agent, rec.model)).find((e) => e.value === value);
+      if (!choice) return void (await ctx.answerCallbackQuery({ text: "This model doesn't offer that effort. Run /effort again." }));
+      if (value === (rec.effort ?? "")) {
+        return void (await ctx.answerCallbackQuery({ text: `Already on ${choice.label}.` }));
+      }
+      try {
+        await manager.setEffort(topicId, value || undefined);
+      } catch (err) {
+        log.warn("setEffort failed", String(err));
+        return void (await ctx.answerCallbackQuery({ text: `Could not switch: ${String(err).slice(0, 150)}` }));
+      }
+      await ctx.answerCallbackQuery({ text: `Effort: ${choice.label}` });
+      const when = rec.agent === "claude" ? "from Claude's next response" : manager.isBusy(topicId) ? "from Codex's next turn" : "from the next message";
+      log.info(`topic ${topicId}: effort → ${value || "default"}`);
+      return void (await ctx.editMessageText(`⚡ Effort → <b>${escapeHtml(choice.label)}</b>\n<i>Applies ${when}.</i>`, { parse_mode: "HTML" }));
     }
     await ctx.answerCallbackQuery({ text: "Unknown choice." });
   });
@@ -275,7 +349,8 @@ export function registerHandlers(
     await bot.api.sendMessage(
       chatId!,
       `${a.emoji} <b>${a.label}</b> in <code>${escapeHtml(project.path)}</code>\n` +
-        `🧠 ${escapeHtml(await models.defaultName(agent))} <i>(default, /model to switch)</i>\n<i>${mode}</i>` +
+        `🧠 ${escapeHtml(await models.defaultName(agent))} <i>(default, /model to switch)</i>\n` +
+        `⚡ ${escapeHtml(await models.effortLabel(agent, undefined, undefined))} effort <i>(/effort to switch)</i>\n<i>${mode}</i>` +
         (wizard.task ? "" : "\n\nSend the first message to start."),
       { message_thread_id: topicId, parse_mode: "HTML" },
     );

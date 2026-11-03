@@ -2,6 +2,7 @@ import path from "node:path";
 import {
   query,
   type CanUseTool,
+  type EffortLevel,
   type Options,
   type Query,
   type SDKMessage,
@@ -19,6 +20,8 @@ export interface ClaudeSessionInit {
   resume?: string;
   /** Model for this session; undefined: Claude Code's default. */
   model?: string;
+  /** Effort for this session; undefined: the model's default. */
+  effort?: string;
 }
 
 /**
@@ -39,6 +42,7 @@ export class ClaudeSession implements AgentSession {
   /** Latest assistant text this turn: intermediate if a tool call follows, else it is the final answer. */
   private pendingText?: string;
   private model?: string;
+  private effort?: EffortLevel;
 
   constructor(
     private readonly cfg: Config["claude"],
@@ -47,6 +51,7 @@ export class ClaudeSession implements AgentSession {
   ) {
     this.sessionId = init.resume;
     this.model = init.model;
+    this.effort = init.effort as EffortLevel | undefined;
   }
 
   get busy(): boolean {
@@ -71,6 +76,12 @@ export class ClaudeSession implements AgentSession {
     if (this.q) await this.q.setModel(model);
   }
 
+  async setEffort(effort: string | undefined): Promise<void> {
+    this.effort = effort as EffortLevel | undefined;
+    // null clears the session override: back to the model's default effort.
+    if (this.q) await this.q.applyFlagSettings({ effortLevel: this.effort ?? null });
+  }
+
   async interrupt(): Promise<void> {
     if (!this.q || !this.running) return;
     this.interrupted = true;
@@ -90,7 +101,7 @@ export class ClaudeSession implements AgentSession {
       cwd: this.init.cwd,
       resume: this.sessionId,
       model: this.model,
-      effort: this.cfg.effort,
+      effort: this.effort,
       permissionMode: this.cfg.permissionMode,
       allowDangerouslySkipPermissions: this.cfg.permissionMode === "bypassPermissions" || undefined,
       pathToClaudeCodeExecutable: this.cfg.executable,

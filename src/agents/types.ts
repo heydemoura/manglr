@@ -45,6 +45,11 @@ export interface AgentSession {
    * Claude switches from its next response, even mid-turn; Codex from its next turn.
    */
   setModel(model: string | undefined): Promise<void>;
+  /**
+   * Switch the reasoning effort for what comes next (undefined: the default).
+   * Claude switches from its next response, even mid-turn; Codex from its next turn.
+   */
+  setEffort(effort: string | undefined): Promise<void>;
   /** Stop the running turn; the session stays usable. */
   interrupt(): Promise<void>;
   /** End the session for good (the transcript stays on disk). */

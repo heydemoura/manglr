@@ -55,6 +55,13 @@ export class SessionManager {
     await this.live.get(topicId)?.session.setModel(this.effectiveModel(record));
   }
 
+  /** Switch a session's reasoning effort; `undefined` goes back to the configured default. */
+  async setEffort(topicId: number, effort: string | undefined): Promise<void> {
+    const record = this.store.update(topicId, { effort });
+    if (!record) throw new Error(`no session for topic ${topicId}`);
+    await this.live.get(topicId)?.session.setEffort(this.effectiveEffort(record));
+  }
+
   async stop(topicId: number): Promise<boolean> {
     const live = this.live.get(topicId);
     if (!live?.session.busy) return false;
@@ -92,7 +99,7 @@ export class SessionManager {
     const ui = new TopicUI(this.api, this.cfg.telegram.chatId!, topicId, this.permissions, (sessionId) => {
       this.store.update(topicId, { sessionId });
     });
-    const init = { cwd: record.cwd, resume: record.sessionId, model: this.effectiveModel(record) };
+    const init = { cwd: record.cwd, resume: record.sessionId, model: this.effectiveModel(record), effort: this.effectiveEffort(record) };
     const session: AgentSession =
       record.agent === "claude" ? new ClaudeSession(this.cfg.claude, init, ui) : new CodexSession(this.cfg.codex, init, ui);
     const live = { session, ui };
@@ -100,6 +107,7 @@ export class SessionManager {
     log.info(
       `session for topic ${topicId}: ${record.agent} in ${record.cwd}` +
         (init.model ? ` with ${init.model}` : "") +
+        (init.effort ? ` at ${init.effort} effort` : "") +
         (record.sessionId ? ` (resuming ${record.sessionId})` : ""),
     );
     return live;
@@ -108,5 +116,10 @@ export class SessionManager {
   /** The session's own pick, else the env default, else undefined (the agent's default). */
   private effectiveModel(record: SessionRecord): string | undefined {
     return record.model ?? (record.agent === "claude" ? this.cfg.claude.model : this.cfg.codex.model);
+  }
+
+  /** The session's own pick, else the env default, else undefined (the model's default). */
+  private effectiveEffort(record: SessionRecord): string | undefined {
+    return record.effort ?? (record.agent === "claude" ? this.cfg.claude.effort : this.cfg.codex.reasoningEffort);
   }
 }

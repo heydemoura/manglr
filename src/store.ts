@@ -18,6 +18,8 @@ export interface SessionRecord {
   autoTitle?: boolean;
   /** Model picked in Telegram for this session; unset: the configured default. */
   model?: string;
+  /** Reasoning effort picked in Telegram for this session; unset: the configured default. */
+  effort?: string;
 }
 
 /**

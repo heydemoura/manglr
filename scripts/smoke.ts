@@ -6,7 +6,7 @@
  *   npm run smoke -- codex "what files are here?" [folder]
  *
  * Without a folder it works in a fresh temp directory. SMOKE_RESUME=<session id>
- * resumes a session; SMOKE_MODEL=<model> picks the model; SMOKE_PERMISSION=deny
+ * resumes a session; SMOKE_MODEL=<model> picks the model; SMOKE_EFFORT=<level> the effort; SMOKE_PERMISSION=deny
  * denies every permission request.
  */
 import { mkdtempSync, realpathSync } from "node:fs";
@@ -43,7 +43,7 @@ const events: AgentEvents = {
   },
 };
 
-const init = { cwd, resume: process.env.SMOKE_RESUME, model: process.env.SMOKE_MODEL };
+const init = { cwd, resume: process.env.SMOKE_RESUME, model: process.env.SMOKE_MODEL, effort: process.env.SMOKE_EFFORT };
 const session: AgentSession =
   kind === "claude"
     ? new ClaudeSession({ permissionMode: "default" }, init, events)

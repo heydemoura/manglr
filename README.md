@@ -47,6 +47,7 @@ Requirements: Node 22+, a logged-in Claude Code (`claude`) and Codex (`codex log
 | `/new [task]` | Pick the agent; opens a thread. With a task it starts right away, otherwise the first message in the thread starts it (and names the thread). |
 | reply in a thread | Goes to that session. While it works: Claude folds it into the running turn, Codex queues it for the next turn. |
 | `/model` or 🧠 | New threads use each agent's default model on this host. Switch a thread's model from a button menu (also on `/status`). |
+| `/effort` or ⚡ | Switch a thread's reasoning effort from a button menu (also on `/status`). Only the levels the thread's model accepts are offered. |
 | `/stop` or ⏹ | Interrupts the running turn; the session continues with your next message. |
 | `/end` | Ends the session and closes the thread. The transcript stays on disk. |
 | `/status` | Agent, folder, session id, model, permission/sandbox mode. |
@@ -65,6 +66,14 @@ same list as its `/model`) and the models the Codex CLI caches in
 set, else the agent's own default. Claude switches in place, from its next
 response (also mid-turn); Codex resumes the same thread with the new model on
 its next turn. The conversation carries over either way.
+
+**Effort.** Each thread also has its own reasoning effort, kept across restarts.
+*Default* is `CLAUDE_EFFORT` / `CODEX_REASONING_EFFORT` when set, else the
+agent's own default (for Codex, `model_reasoning_effort` in its config.toml).
+The menu lists the levels the thread's model reports (Claude Code's
+`supportedEffortLevels`, Codex's `supported_reasoning_levels`). Claude switches
+from its next response, Codex from its next turn. Switching to a model that
+lacks the thread's effort puts it back on *Default*.
 
 **Restarts.** The gateway only stores topic → session id (`data/sessions.json`);
 the agents keep their transcripts (`~/.claude/projects`, `~/.codex/sessions`).
@@ -87,7 +96,7 @@ impersonate the bot, not you.
 ```sh
 npm run dev         # tsx watch
 npm run typecheck   # src, tests and scripts
-npm test            # formatting, chunking and /model menu tests
+npm test            # formatting, chunking, /model and /effort menu tests
 npm run smoke -- claude "create hello.txt containing hi"   # one turn, no Telegram
 npm run smoke -- codex "what files are here?" ~/some/folder
 npm run build && npm start
@@ -95,7 +104,7 @@ npm run build && npm start
 
 `scripts/smoke.ts` drives an agent adapter from the terminal and prints every
 event: useful to check SDK behaviour without the bot. `SMOKE_RESUME=<id>`
-resumes a session, `SMOKE_MODEL=<model>` picks the model, `SMOKE_PERMISSION=deny`
+resumes a session, `SMOKE_MODEL=<model>` picks the model, `SMOKE_EFFORT=<level>` the effort, `SMOKE_PERMISSION=deny`
 denies permission requests.
 
 ### Layout
