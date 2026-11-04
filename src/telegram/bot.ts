@@ -29,6 +29,9 @@ interface Wizard {
   userId: number;
 }
 
+/** Unfinished /new menus kept at once; the oldest is dropped past this. */
+const MAX_WIZARDS = 50;
+
 const clip = (s: string, max: number) => (s.length > max ? `${s.slice(0, max - 1)}…` : s);
 const firstLine = (s: string) => s.trim().split("\n")[0]!.trim();
 
@@ -94,6 +97,7 @@ export function registerHandlers(
         remoteHosts.length
           ? "• /new [task]: pick the computer, then Claude or Codex; a new thread opens for the session."
           : "• /new [task]: pick Claude or Codex; a new thread opens for the session.",
+        "• Or just send the task in General (or reply /new to a message): it becomes the new session's first prompt.",
         "• Reply in a thread to talk to its agent. Messages sent while it works are passed along.",
         "• Tool permission requests (Claude) show up with Allow / Deny buttons.",
         "• /model switches the model of a thread's session, /effort its reasoning effort.",
@@ -122,12 +126,29 @@ export function registerHandlers(
     return keyboard.row().text("Cancel", "new:x");
   }
 
-  bot.command("new", async (ctx) => {
-    const task = ctx.match.trim() || undefined;
+  /**
+   * Open the /new menu. `task` becomes the session's first prompt once the
+   * computer and agent are picked; `replyTo` attaches the menu to the message it came from.
+   */
+  async function openWizard(ctx: Context, task: string | undefined, replyTo?: number): Promise<void> {
     // With remote hosts, the computer comes first; otherwise straight to the agent.
     const [question, keyboard] = remoteHosts.length ? ["Which computer?", hostKeyboard()] : ["Which agent?", agentKeyboard()];
-    const msg = await ctx.reply(newPrompt(task, question), { parse_mode: "HTML", reply_markup: keyboard, message_thread_id: topicOf(ctx) });
+    const msg = await ctx.reply(newPrompt(task, question), {
+      parse_mode: "HTML",
+      reply_markup: keyboard,
+      message_thread_id: topicOf(ctx),
+      ...(replyTo === undefined ? {} : { reply_parameters: { message_id: replyTo, allow_sending_without_reply: true } }),
+    });
     wizards.set(msg.message_id, { task, userId: ctx.from!.id });
+    if (wizards.size > MAX_WIZARDS) wizards.delete(wizards.keys().next().value!);
+  }
+
+  bot.command("new", async (ctx) => {
+    // `/new` sent as a reply to a message takes that message as the task.
+    const replied = ctx.msg.reply_to_message;
+    const quoted = ctx.match.trim() ? undefined : replied?.text?.trim();
+    const task = ctx.match.trim() || quoted || undefined;
+    await openWizard(ctx, task, quoted ? replied!.message_id : undefined);
   });
 
   bot.command("list", async (ctx) => {
@@ -429,7 +450,10 @@ export function registerHandlers(
   bot.on("message:text", async (ctx) => {
     const topicId = topicOf(ctx);
     if (topicId === undefined) {
-      return void (await ctx.reply("Start a session with /new. Each session gets its own thread."));
+      // A message in General is a task: ask where and with which agent, then open a thread for it.
+      const text = ctx.msg.text.trim();
+      if (!text || text.startsWith("/")) return void (await ctx.reply("Start a session with /new. Each session gets its own thread."));
+      return openWizard(ctx, text, ctx.msg.message_id);
     }
     const rec = store.get(topicId);
     if (!rec) return void (await ctx.reply("This thread isn't linked to an agent. Start one with /new.", { message_thread_id: topicId }));

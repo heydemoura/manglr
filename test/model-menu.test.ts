@@ -78,7 +78,7 @@ function harness(hosts?: HostDirectory) {
   registerHandlers(bot, cfg, store, manager, {} as PermissionBroker, models, hosts);
 
   let updateId = 0;
-  const send = (text: string, topic: number | null = TOPIC) =>
+  const send = (text: string, topic: number | null = TOPIC, extra: Record<string, unknown> = {}) =>
     bot.handleUpdate({
       update_id: ++updateId,
       message: {
@@ -89,6 +89,7 @@ function harness(hosts?: HostDirectory) {
         text,
         ...(topic === null ? {} : { message_thread_id: topic, is_topic_message: true }),
         ...(text.startsWith("/") ? { entities: [{ type: "bot_command", offset: 0, length: text.split(" ")[0]!.length }] } : {}),
+        ...extra,
       },
     } as Update);
   const tap = (data: string, messageId = 99) =>
@@ -307,4 +308,96 @@ test("with remote hosts, /new asks for the computer first and the thread runs th
 
   await h.send("/status", TOPIC + 1);
   assert.match(last(h.calls, "sendMessage").payload.text, /host: bazzite/);
+});
+
+const REMOTE_HOSTS = (): HostDirectory => {
+  const remote = new ModelCatalog({ workdir: { path: "~" }, claude: {}, codex: {} });
+  remote.list = async () => [{ value: "", label: "Default", description: "Sonnet 5.5", efforts: [] }];
+  return {
+    names: () => ["bazzite", "debian"],
+    config: (name) => ({ name, ssh: name, cwd: "~/Code", command: "runner" }),
+    catalog: () => remote,
+  };
+};
+
+test("a message in General becomes the first prompt of a new thread, after picking computer and agent", async () => {
+  const h = harness(REMOTE_HOSTS());
+  await h.bot.init();
+  const task = "Fix the flaky upload test\nIt fails on CI about once in ten runs.";
+  await h.send(task, null);
+  const sourceId = 1; // the first update's message_id
+  const menu = last(h.calls, "sendMessage");
+  assert.equal(menu.payload.message_thread_id, undefined, "the menu stays in General");
+  assert.equal(menu.payload.reply_parameters.message_id, sourceId, "attached to the captured message");
+  assert.match(menu.payload.text, /New session for:\n<i>Fix the flaky upload test/);
+  assert.match(menu.payload.text, /Which computer\?/);
+  assert.equal(h.calls.filter((c) => c.method === "createForumTopic").length, 0, "nothing starts before the picks");
+
+  const menuId = 100 + h.calls.indexOf(menu) + 1;
+  await h.tap("new:h:debian", menuId);
+  assert.match(last(h.calls, "editMessageText").payload.text, /on <b>debian<\/b>\. Which agent\?/);
+  assert.deepEqual(h.started, []);
+
+  await h.tap("new:a:codex", menuId);
+  assert.equal(last(h.calls, "createForumTopic").payload.name, "🟢 debian: Fix the flaky upload test");
+  const rec = h.store.get(TOPIC + 1)!;
+  assert.equal(rec.agent, "codex");
+  assert.equal(rec.host, "debian");
+  assert.equal(rec.autoTitle, false);
+  assert.deepEqual(h.started, [task], "the whole captured message is the first prompt");
+  assert.match(last(h.calls, "editMessageText").payload.text, /debian<\/b> → <a href="https:\/\/t\.me\/c\/1234567890\/8">/);
+
+  // The menu is spent.
+  await h.tap("new:a:claude", menuId);
+  assert.equal(last(h.calls, "answerCallbackQuery").payload.text, "This menu has expired. Run /new again.");
+});
+
+test("without remote hosts, a General message only asks for the agent", async () => {
+  const h = harness();
+  await h.bot.init();
+  await h.send("summarize the open PRs", null);
+  const menu = last(h.calls, "sendMessage");
+  assert.match(menu.payload.text, /Which agent\?/);
+  assert.deepEqual(buttons(menu).map((b) => b.callback_data), ["new:a:claude", "new:a:codex", "new:x"]);
+  await h.tap("new:a:claude", 100 + h.calls.indexOf(menu) + 1);
+  assert.equal(last(h.calls, "createForumTopic").payload.name, "🟠 summarize the open PRs");
+  assert.equal(h.store.get(TOPIC + 1)!.cwd, "/tmp");
+  assert.deepEqual(h.started, ["summarize the open PRs"]);
+});
+
+test("cancelling a General message's menu starts nothing", async () => {
+  const h = harness();
+  await h.bot.init();
+  await h.send("do the thing", null);
+  const menuId = 100 + h.calls.indexOf(last(h.calls, "sendMessage")) + 1;
+  await h.tap("new:x", menuId);
+  assert.equal(last(h.calls, "deleteMessage").payload.message_id, menuId);
+  await h.tap("new:a:claude", menuId);
+  assert.equal(h.calls.filter((c) => c.method === "createForumTopic").length, 0);
+  assert.deepEqual(h.started, []);
+});
+
+test("/new as a reply to a message takes that message as the task", async () => {
+  const h = harness();
+  await h.bot.init();
+  const quoted = { message_id: 55, date: 0, chat: CHAT, from: USER, text: "port the player to the new API" };
+  await h.send("/new", null, { reply_to_message: quoted });
+  const menu = last(h.calls, "sendMessage");
+  assert.match(menu.payload.text, /<i>port the player to the new API<\/i>/);
+  assert.equal(menu.payload.reply_parameters.message_id, 55);
+  await h.tap("new:a:claude", 100 + h.calls.indexOf(menu) + 1);
+  assert.deepEqual(h.started, ["port the player to the new API"]);
+
+  // A task typed after /new wins over the replied-to message.
+  await h.send("/new something else", null, { reply_to_message: quoted });
+  assert.match(last(h.calls, "sendMessage").payload.text, /<i>something else<\/i>/);
+});
+
+test("unknown commands in General still point to /new instead of becoming tasks", async () => {
+  const h = harness();
+  await h.bot.init();
+  await h.send("/frobnicate", null);
+  const reply = last(h.calls, "sendMessage");
+  assert.equal(reply.payload.text, "Start a session with /new. Each session gets its own thread.");
+  assert.equal(reply.payload.reply_markup, undefined);
 });
