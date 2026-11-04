@@ -2,6 +2,12 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync, existsSync } from "
 import path from "node:path";
 import type { AgentKind } from "./agents/types.js";
 
+export type SessionActivity = "ready" | "working" | "idle" | "ended";
+export interface TitleContext {
+  role: "user" | "assistant";
+  text: string;
+}
+
 /** One Telegram topic ↔ one agent session. */
 export interface SessionRecord {
   topicId: number;
@@ -11,6 +17,12 @@ export interface SessionRecord {
   project: string;
   cwd: string;
   title: string;
+  activity?: SessionActivity;
+  /** Small context window for title summaries, not the agent's transcript. */
+  titleContext?: TitleContext[];
+  /** Gateway session card, edited in place and pinned inside this topic. */
+  pinnedMessageId?: number;
+  cardPinned?: boolean;
   /** Claude session id / Codex thread id, known after the first turn starts. */
   sessionId?: string;
   createdAt: string;

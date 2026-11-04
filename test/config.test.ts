@@ -14,6 +14,7 @@ test("gateway settings, the bot token above all, are not inherited by agents", (
       TELEGRAM_CHAT_ID: "-1001",
       TELEGRAM_ALLOWED_USER_IDS: "42",
       CLAUDE_PERMISSION_MODE: "bypassPermissions",
+      TOPIC_TITLE_MODEL: "sonnet",
       WHISPER_MODEL_PATH: "~/models/whisper.bin",
       WHISPER_PATH: "~/bin/whisper-cli",
       FFMPEG_PATH: "/opt/homebrew/bin/ffmpeg",
@@ -22,6 +23,7 @@ test("gateway settings, the bot token above all, are not inherited by agents", (
     const cfg = loadConfig();
     assert.equal(cfg.telegram.token, "1:secret");
     assert.equal(cfg.claude.permissionMode, "bypassPermissions");
+    assert.equal(cfg.topicTitleModel, "sonnet");
     assert.deepEqual(cfg.transcription, {
       modelPath: path.join(homedir(), "models/whisper.bin"),
       executable: path.join(homedir(), "bin/whisper-cli"),
@@ -37,7 +39,9 @@ test("gateway settings, the bot token above all, are not inherited by agents", (
     assert.equal(process.env.WHISPER_MODEL_PATH, undefined);
 
     Object.assign(process.env, { TELEGRAM_BOT_TOKEN: "1:secret" });
-    assert.deepEqual(loadConfig().transcription, {
+    const defaults = loadConfig();
+    assert.equal(defaults.topicTitleModel, "haiku");
+    assert.deepEqual(defaults.transcription, {
       modelPath: path.join(homedir(), ".cache/manglr/ggml-small.bin"),
       executable: "whisper-cli",
       ffmpegPath: "ffmpeg",

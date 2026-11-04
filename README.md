@@ -8,7 +8,7 @@ in the thread become its next input.
 
 ```
 General:   fix the login redirect          (or /new fix the login redirect)
-           → [🟠 Claude] [🟢 Codex] → new thread "🟠 fix the login redirect"
+           → [🟠 Claude] [🟢 Codex] → new thread "💤 fix the login redirect"
 Thread:    ⏳ Working…  (edited live: 💻 npm test · ✏️ Edit src/auth.ts …)  [⏹ Stop]
            🔐 Bash needs permission  `git push`   [Allow] [Always allow] [Deny]
            💬 the agent's answer
@@ -26,7 +26,7 @@ your existing `claude` and `codex` logins on this host.
 
 1. **Bot**: talk to [@BotFather](https://t.me/BotFather), `/newbot`, keep the token.
 2. **Group**: create a Telegram group with just you, open its settings and turn on
-   **Topics**. Add the bot and make it an **admin** with *Manage topics* (admins
+   **Topics**. Add the bot and make it an **admin** with *Manage topics* and *Pin messages* (admins
    receive every message, so privacy mode doesn't matter).
 3. **Config**:
    ```sh
@@ -78,9 +78,30 @@ The menu lists the levels the thread's model reports (Claude Code's
 from its next response, Codex from its next turn. Switching to a model that
 lacks the thread's effort puts it back on *Default*.
 
-**Restarts.** The gateway only stores topic → session id (`data/sessions.json`);
+**Topic names and pinned cards.** Topic names summarize the session's conversation
+and update as its focus changes. The leading emoji is the session state:
+`💤` idle before the first prompt, while waiting for approval, or after a stop/error;
+`⏳` working; `✅` ready after a successful turn; `⏹` ended. Agent-colored dots
+are kept in agent picker menus; topic names use the state emoji.
+
+Each topic has one pinned session card showing the local hostname or remote host
+name, agent, folder, model, effort, state, and session id. The gateway edits this
+card as the session changes and reuses it after restarts. Existing open topics
+get cards on startup. The bot needs Telegram's **Pin messages** permission.
+
+Title summaries run in the background through the gateway's existing Claude
+login, including for Codex and remote sessions. `TOPIC_TITLE_MODEL` defaults to
+`haiku`. These are separate short inference requests with no tools, MCP servers,
+project settings, or saved helper sessions. A bounded context window (original
+goal and recent user messages/final answers) is kept with the topic metadata.
+If summarization is unavailable, the topic keeps its current title; sending
+prompts and updating state continue normally.
+
+**Restarts.** The gateway stores topic → session id and display metadata
+(`data/sessions.json`);
 the agents keep their transcripts (`~/.claude/projects`, `~/.codex/sessions`).
-After a restart, the next message in a thread resumes its session.
+After a restart, the next message in a thread resumes its session. A topic that
+was working is reset to idle until its next turn.
 
 **Voice prompts.** Transcription runs locally on the gateway with
 [whisper.cpp](https://github.com/ggml-org/whisper.cpp). Install its `whisper-cli`
@@ -117,8 +138,9 @@ minutes per recording.
 
 The gateway can also run agents on other computers. With a hosts file,
 `/new` first asks which computer, and the thread's agent runs there: with that
-computer's files, its `claude` / `codex` logins and settings. Thread names
-start with the host (`🟠 bazzite: fix the tests`) and `/status` shows it.
+computer's files, its `claude` / `codex` logins and settings. The pinned session
+card and `/status` identify the host; the topic name shows the conversation summary
+and state (`⏳ Fix flaky upload tests`).
 
 ```
 Telegram ⇄ gateway ──ssh──▶ runner on bazzite ──▶ Claude / Codex
@@ -220,6 +242,8 @@ src/telegram/bot.ts       commands, /new menu, routing, buttons
 src/telegram/voice.ts     Telegram voice downloads → local transcription
 src/telegram/local-whisper.ts  FFmpeg conversion, whisper.cpp, temporary file cleanup
 src/telegram/topic-ui.ts  per-thread UI: typing, live status message, replies
+src/telegram/session-topics.ts  status emoji, topic names, pinned session cards
+src/topic-titles.ts       isolated background conversation summaries
 src/telegram/permissions.ts  permission prompts ↔ buttons
 src/telegram/format.ts    Markdown → Telegram HTML, 4096-char chunking
 ```

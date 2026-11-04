@@ -13,6 +13,7 @@ import { registerHandlers } from "../src/telegram/bot.js";
 import type { PermissionBroker } from "../src/telegram/permissions.js";
 import type { HostDirectory } from "../src/remote/registry.js";
 import { VoiceError, type VoiceTranscriber } from "../src/telegram/voice.js";
+import { SessionTopics } from "../src/telegram/session-topics.js";
 
 const CHAT = { id: -1001234567890, type: "supergroup" as const, title: "agents", is_forum: true as const };
 const USER = { id: 42, is_bot: false, first_name: "me" };
@@ -51,11 +52,13 @@ function harness(hosts?: HostDirectory, transcribeVoice?: VoiceTranscriber) {
   const switched: (string | undefined)[] = [];
   const efforts: (string | undefined)[] = [];
   const started: string[] = [];
+  let topics: SessionTopics;
   const manager = {
     isBusy: () => false,
     create: (topicId: number, agent: "claude" | "codex", project: { name: string; path: string }, title: string, autoTitle: boolean, host?: string) =>
       store.upsert({ topicId, agent, host, project: project.name, cwd: project.path, title, autoTitle }),
     send: (_topicId: number, text: string) => void started.push(text),
+    initializeTopic: (topicId: number) => topics.refresh(topicId),
     setModel: async (topicId: number, model: string | undefined) => {
       switched.push(model);
       store.update(topicId, { model });
@@ -77,6 +80,7 @@ function harness(hosts?: HostDirectory, transcribeVoice?: VoiceTranscriber) {
   // The real catalog, with the list Claude Code would report.
   const models = new ModelCatalog(cfg);
   models.list = async () => CLAUDE_MODELS;
+  topics = new SessionTopics(cfg, bot.api, store, models, async (title) => title, hosts);
   registerHandlers(bot, cfg, store, manager, {} as PermissionBroker, models, hosts, transcribeVoice);
 
   let updateId = 0;
@@ -188,9 +192,13 @@ test("a new thread starts on the host's default model without asking", async () 
   await h.tap("new:a:claude", 100 + h.calls.indexOf(menu) + 1);
   const welcome = last(h.calls, "sendMessage");
   assert.equal(welcome.payload.message_thread_id, TOPIC + 1);
-  assert.match(welcome.payload.text, /🧠 Opus 5\.5 <i>\(default, \/model to switch\)<\/i>/);
+  assert.match(welcome.payload.text, /🧠 Default \(Opus 5\.5\) <i>\(\/model to switch\)<\/i>/);
   assert.match(welcome.payload.text, /⚡ Default effort <i>\(\/effort to switch\)<\/i>/);
-  assert.equal(welcome.payload.reply_markup, undefined);
+  assert.deepEqual(buttons(welcome), [
+    { text: "🧠 Change model", callback_data: "mdl:o" },
+    { text: "⚡ Change effort", callback_data: "eff:o" },
+  ]);
+  assert.equal(last(h.calls, "pinChatMessage").payload.message_id, 100 + h.calls.indexOf(welcome) + 1);
   assert.equal(h.store.get(TOPIC + 1)!.model, undefined);
   assert.deepEqual(h.started, ["fix the tests"]);
 });
@@ -299,13 +307,14 @@ test("with remote hosts, /new asks for the computer first and the thread runs th
   assert.deepEqual(buttons(agentMenu).map((b) => b.callback_data), ["new:a:claude", "new:a:codex", "new:x"]);
 
   await h.tap("new:a:claude", menuId);
-  assert.equal(last(h.calls, "createForumTopic").payload.name, "🟠 bazzite: fix the tests");
+  assert.equal(last(h.calls, "createForumTopic").payload.name, "💤 fix the tests");
   const rec = h.store.get(TOPIC + 1)!;
   assert.equal(rec.host, "bazzite");
   assert.equal(rec.cwd, "~/Code");
   const welcome = last(h.calls, "sendMessage");
-  assert.match(welcome.payload.text, /on <b>bazzite<\/b> in <code>~\/Code<\/code>/);
-  assert.match(welcome.payload.text, /🧠 Sonnet 5\.5/, "the remote host's default model");
+  assert.match(welcome.payload.text, /Host: <b>bazzite<\/b> \(remote\)/);
+  assert.match(welcome.payload.text, /Folder: <code>~\/Code<\/code>/);
+  assert.match(welcome.payload.text, /🧠 Default \(Sonnet 5\.5\)/, "the remote host's default model");
   assert.deepEqual(h.started, ["fix the tests"]);
 
   await h.send("/status", TOPIC + 1);
@@ -341,7 +350,7 @@ test("a message in General becomes the first prompt of a new thread, after picki
   assert.deepEqual(h.started, []);
 
   await h.tap("new:a:codex", menuId);
-  assert.equal(last(h.calls, "createForumTopic").payload.name, "🟢 debian: Fix the flaky upload test");
+  assert.equal(last(h.calls, "createForumTopic").payload.name, "💤 Fix the flaky upload test");
   const rec = h.store.get(TOPIC + 1)!;
   assert.equal(rec.agent, "codex");
   assert.equal(rec.host, "debian");
@@ -362,7 +371,7 @@ test("without remote hosts, a General message only asks for the agent", async ()
   assert.match(menu.payload.text, /Which agent\?/);
   assert.deepEqual(buttons(menu).map((b) => b.callback_data), ["new:a:claude", "new:a:codex", "new:x"]);
   await h.tap("new:a:claude", 100 + h.calls.indexOf(menu) + 1);
-  assert.equal(last(h.calls, "createForumTopic").payload.name, "🟠 summarize the open PRs");
+  assert.equal(last(h.calls, "createForumTopic").payload.name, "💤 summarize the open PRs");
   assert.equal(h.store.get(TOPIC + 1)!.cwd, "/tmp");
   assert.deepEqual(h.started, ["summarize the open PRs"]);
 });
@@ -407,14 +416,13 @@ test("unknown commands in General still point to /new instead of becoming tasks"
 const VOICE = { file_id: "voice-id", file_unique_id: "unique", duration: 5, mime_type: "audio/ogg", file_size: 100 };
 const voiceMessage = { text: undefined, voice: VOICE };
 
-test("voice notes show a literal preview and send the full transcript to the session, including auto-title", async () => {
+test("voice notes show a literal preview and send the full transcript to the session", async () => {
   const transcript = "Corrija <b>o login</b> & adicione testes.\n" + "More detail. ".repeat(400);
   const h = harness(undefined, async (voice) => {
     assert.equal(voice.file_id, VOICE.file_id);
     return transcript;
   });
   await h.bot.init();
-  h.store.update(TOPIC, { autoTitle: true });
   await h.send("", TOPIC, voiceMessage);
   const progress = last(h.calls, "sendMessage");
   assert.equal(progress.payload.text, "🎙 Transcribing…");
@@ -426,8 +434,6 @@ test("voice notes show a literal preview and send the full transcript to the ses
   assert.match(preview.payload.text, /<b>o login<\/b> &/);
   assert.equal(preview.payload.parse_mode, undefined, "transcribed markup is literal text");
   assert.deepEqual(h.started, [transcript], "the preview truncation never truncates the prompt");
-  assert.equal(h.store.get(TOPIC)!.autoTitle, false);
-  assert.equal(last(h.calls, "editForumTopic").payload.name, "🟠 Corrija <b>o login</b> & adicione testes.");
 });
 
 test("voice in General opens the host/agent picker and starts a remote Codex session with the transcript", async () => {

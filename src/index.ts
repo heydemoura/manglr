@@ -8,6 +8,8 @@ import { SessionStore } from "./store.js";
 import { COMMANDS, registerHandlers } from "./telegram/bot.js";
 import { PermissionBroker } from "./telegram/permissions.js";
 import { log } from "./util/log.js";
+import { createTitleSummarizer } from "./topic-titles.js";
+import { SessionTopics } from "./telegram/session-topics.js";
 
 let cfg: Config;
 try {
@@ -22,8 +24,9 @@ bot.api.config.use(autoRetry({ maxRetryAttempts: 5, maxDelaySeconds: 60 }));
 const store = new SessionStore(cfg.dataDir);
 const permissions = new PermissionBroker(bot.api);
 const hosts = new HostRegistry(cfg);
-const manager = new SessionManager(cfg, bot.api, store, permissions, hosts);
 const models = new ModelCatalog(cfg);
+const topics = new SessionTopics(cfg, bot.api, store, models, createTitleSummarizer(cfg), hosts);
+const manager = new SessionManager(cfg, bot.api, store, permissions, hosts, topics);
 registerHandlers(bot, cfg, store, manager, permissions, models, hosts);
 
 if (cfg.setupMode) {
@@ -43,6 +46,7 @@ if (cfg.setupMode) {
         "Make it an admin with Manage Topics (group settings → Administrators).",
     );
   }
+  if (me.status === "administrator" && !me.can_pin_messages) log.warn("The bot needs Pin Messages permission to pin session cards.");
   await bot.api.setMyCommands(COMMANDS, { scope: { type: "chat", chat_id: cfg.telegram.chatId! } });
   void models.list("claude"); // warm the model menu (starts Claude Code once, no prompt)
   void models.list("codex");
@@ -65,7 +69,10 @@ process.on("SIGTERM", () => void shutdown("SIGTERM"));
 try {
   await bot.start({
     allowed_updates: ["message", "callback_query"],
-    onStart: (me) => log.info(`Bot @${me.username} is polling`),
+    onStart: (me) => {
+      log.info(`Bot @${me.username} is polling`);
+      void manager.restoreTopics().catch(() => log.warn("Could not restore topic titles and session cards"));
+    },
   });
 } catch (err) {
   // bot.stop() during a retry backoff rejects start() with "Aborted delay".
