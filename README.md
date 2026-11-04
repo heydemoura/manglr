@@ -7,7 +7,7 @@ group: the agent's replies and progress show up in the thread, and your replies
 in the thread become its next input.
 
 ```
-General:   /new fix the login redirect
+General:   fix the login redirect          (or /new fix the login redirect)
            → [🟠 Claude] [🟢 Codex] → new thread "🟠 fix the login redirect"
 Thread:    ⏳ Working…  (edited live: 💻 npm test · ✏️ Edit src/auth.ts …)  [⏹ Stop]
            🔐 Bash needs permission  `git push`   [Allow] [Always allow] [Deny]
@@ -46,6 +46,7 @@ Requirements: Node 22+, a logged-in Claude Code (`claude`) and Codex (`codex log
 | | |
 |---|---|
 | `/new [task]` | Pick the agent; opens a thread. With a task it starts right away, otherwise the first message in the thread starts it (and names the thread). |
+| message in General | Same as `/new <message>`: the message is kept as the task, you pick the computer and agent, and the new thread starts with it as the first prompt. Replying `/new` to any message does the same with that message. |
 | reply in a thread | Goes to that session. While it works: Claude folds it into the running turn, Codex queues it for the next turn. |
 | `/model` or 🧠 | New threads use each agent's default model on this host. Switch a thread's model from a button menu (also on `/status`). |
 | `/effort` or ⚡ | Switch a thread's reasoning effort from a button menu (also on `/status`). Only the levels the thread's model accepts are offered. |
