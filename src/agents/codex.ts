@@ -115,7 +115,11 @@ export class CodexSession implements AgentSession {
       }
     } catch (err) {
       if (this.abort.signal.aborted) interrupted = true;
-      else {
+      else if (error) {
+        // Codex reported why the turn failed (turn.failed / error), then exited 1.
+        // The exit error only carries stderr ("Reading prompt from stdin..."): keep the reason.
+        log.error(`codex turn failed: ${error}`);
+      } else {
         log.error("codex turn failed", err);
         error = err instanceof Error ? err.message : String(err);
       }
