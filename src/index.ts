@@ -6,6 +6,7 @@ import { HostRegistry } from "./remote/registry.js";
 import { SessionManager } from "./sessions.js";
 import { SessionStore } from "./store.js";
 import { COMMANDS, registerHandlers } from "./telegram/bot.js";
+import { ignoreNotModified } from "./telegram/not-modified.js";
 import { PermissionBroker } from "./telegram/permissions.js";
 import { log } from "./util/log.js";
 import { createTitleSummarizer } from "./topic-titles.js";
@@ -20,6 +21,7 @@ try {
 }
 const bot = new Bot(cfg.telegram.token);
 bot.api.config.use(autoRetry({ maxRetryAttempts: 5, maxDelaySeconds: 60 }));
+bot.api.config.use(ignoreNotModified);
 
 const store = new SessionStore(cfg.dataDir);
 const permissions = new PermissionBroker(bot.api);
