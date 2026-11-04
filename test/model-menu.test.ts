@@ -12,6 +12,8 @@ import { SessionStore } from "../src/store.js";
 import { registerHandlers } from "../src/telegram/bot.js";
 import type { PermissionBroker } from "../src/telegram/permissions.js";
 import type { HostDirectory } from "../src/remote/registry.js";
+import { VoiceError, type VoiceTranscriber } from "../src/telegram/voice.js";
+import { SessionTopics } from "../src/telegram/session-topics.js";
 
 const CHAT = { id: -1001234567890, type: "supergroup" as const, title: "agents", is_forum: true as const };
 const USER = { id: 42, is_bot: false, first_name: "me" };
@@ -31,7 +33,7 @@ interface Call {
 }
 
 /** The real handlers on a bot whose API calls are recorded instead of sent. */
-function harness(hosts?: HostDirectory) {
+function harness(hosts?: HostDirectory, transcribeVoice?: VoiceTranscriber) {
   const calls: Call[] = [];
   const bot = new Bot("1:fake", { botInfo: { id: 1, is_bot: true, first_name: "bot", username: "manglr" } as any });
   bot.api.config.use(async (_prev, method, payload) => {
@@ -50,11 +52,13 @@ function harness(hosts?: HostDirectory) {
   const switched: (string | undefined)[] = [];
   const efforts: (string | undefined)[] = [];
   const started: string[] = [];
+  let topics: SessionTopics;
   const manager = {
     isBusy: () => false,
     create: (topicId: number, agent: "claude" | "codex", project: { name: string; path: string }, title: string, autoTitle: boolean, host?: string) =>
       store.upsert({ topicId, agent, host, project: project.name, cwd: project.path, title, autoTitle }),
     send: (_topicId: number, text: string) => void started.push(text),
+    initializeTopic: (topicId: number) => topics.refresh(topicId),
     setModel: async (topicId: number, model: string | undefined) => {
       switched.push(model);
       store.update(topicId, { model });
@@ -67,6 +71,7 @@ function harness(hosts?: HostDirectory) {
   const cfg = {
     telegram: { token: "1:fake", chatId: CHAT.id, allowedUserIds: new Set([USER.id]) },
     setupMode: false,
+    transcription: { modelPath: "/missing/whisper.bin", executable: "whisper-cli", ffmpegPath: "ffmpeg" },
     workdir: { name: "/tmp", path: "/tmp" },
     dataDir: "/tmp",
     claude: { permissionMode: "default" },
@@ -75,7 +80,8 @@ function harness(hosts?: HostDirectory) {
   // The real catalog, with the list Claude Code would report.
   const models = new ModelCatalog(cfg);
   models.list = async () => CLAUDE_MODELS;
-  registerHandlers(bot, cfg, store, manager, {} as PermissionBroker, models, hosts);
+  topics = new SessionTopics(cfg, bot.api, store, models, async (title) => title, hosts);
+  registerHandlers(bot, cfg, store, manager, {} as PermissionBroker, models, hosts, transcribeVoice);
 
   let updateId = 0;
   const send = (text: string, topic: number | null = TOPIC, extra: Record<string, unknown> = {}) =>
@@ -103,7 +109,7 @@ function harness(hosts?: HostDirectory) {
         message: { message_id: messageId, date: 0, chat: CHAT, text: "menu", message_thread_id: TOPIC, is_topic_message: true },
       },
     } as Update);
-  return { bot, calls, store, switched, efforts, started, send, tap };
+  return { bot, calls, store, switched, efforts, started, send, tap, cfg };
 }
 
 const buttons = (call: Call): { text: string; callback_data: string }[] => call.payload.reply_markup.inline_keyboard.flat();
@@ -186,9 +192,13 @@ test("a new thread starts on the host's default model without asking", async () 
   await h.tap("new:a:claude", 100 + h.calls.indexOf(menu) + 1);
   const welcome = last(h.calls, "sendMessage");
   assert.equal(welcome.payload.message_thread_id, TOPIC + 1);
-  assert.match(welcome.payload.text, /🧠 Opus 5\.5 <i>\(default, \/model to switch\)<\/i>/);
+  assert.match(welcome.payload.text, /🧠 Default \(Opus 5\.5\) <i>\(\/model to switch\)<\/i>/);
   assert.match(welcome.payload.text, /⚡ Default effort <i>\(\/effort to switch\)<\/i>/);
-  assert.equal(welcome.payload.reply_markup, undefined);
+  assert.deepEqual(buttons(welcome), [
+    { text: "🧠 Change model", callback_data: "mdl:o" },
+    { text: "⚡ Change effort", callback_data: "eff:o" },
+  ]);
+  assert.equal(last(h.calls, "pinChatMessage").payload.message_id, 100 + h.calls.indexOf(welcome) + 1);
   assert.equal(h.store.get(TOPIC + 1)!.model, undefined);
   assert.deepEqual(h.started, ["fix the tests"]);
 });
@@ -297,13 +307,14 @@ test("with remote hosts, /new asks for the computer first and the thread runs th
   assert.deepEqual(buttons(agentMenu).map((b) => b.callback_data), ["new:a:claude", "new:a:codex", "new:x"]);
 
   await h.tap("new:a:claude", menuId);
-  assert.equal(last(h.calls, "createForumTopic").payload.name, "🟠 bazzite: fix the tests");
+  assert.equal(last(h.calls, "createForumTopic").payload.name, "💤 fix the tests");
   const rec = h.store.get(TOPIC + 1)!;
   assert.equal(rec.host, "bazzite");
   assert.equal(rec.cwd, "~/Code");
   const welcome = last(h.calls, "sendMessage");
-  assert.match(welcome.payload.text, /on <b>bazzite<\/b> in <code>~\/Code<\/code>/);
-  assert.match(welcome.payload.text, /🧠 Sonnet 5\.5/, "the remote host's default model");
+  assert.match(welcome.payload.text, /Host: <b>bazzite<\/b> \(remote\)/);
+  assert.match(welcome.payload.text, /Folder: <code>~\/Code<\/code>/);
+  assert.match(welcome.payload.text, /🧠 Default \(Sonnet 5\.5\)/, "the remote host's default model");
   assert.deepEqual(h.started, ["fix the tests"]);
 
   await h.send("/status", TOPIC + 1);
@@ -339,7 +350,7 @@ test("a message in General becomes the first prompt of a new thread, after picki
   assert.deepEqual(h.started, []);
 
   await h.tap("new:a:codex", menuId);
-  assert.equal(last(h.calls, "createForumTopic").payload.name, "🟢 debian: Fix the flaky upload test");
+  assert.equal(last(h.calls, "createForumTopic").payload.name, "💤 Fix the flaky upload test");
   const rec = h.store.get(TOPIC + 1)!;
   assert.equal(rec.agent, "codex");
   assert.equal(rec.host, "debian");
@@ -360,7 +371,7 @@ test("without remote hosts, a General message only asks for the agent", async ()
   assert.match(menu.payload.text, /Which agent\?/);
   assert.deepEqual(buttons(menu).map((b) => b.callback_data), ["new:a:claude", "new:a:codex", "new:x"]);
   await h.tap("new:a:claude", 100 + h.calls.indexOf(menu) + 1);
-  assert.equal(last(h.calls, "createForumTopic").payload.name, "🟠 summarize the open PRs");
+  assert.equal(last(h.calls, "createForumTopic").payload.name, "💤 summarize the open PRs");
   assert.equal(h.store.get(TOPIC + 1)!.cwd, "/tmp");
   assert.deepEqual(h.started, ["summarize the open PRs"]);
 });
@@ -400,4 +411,116 @@ test("unknown commands in General still point to /new instead of becoming tasks"
   const reply = last(h.calls, "sendMessage");
   assert.equal(reply.payload.text, "Start a session with /new. Each session gets its own thread.");
   assert.equal(reply.payload.reply_markup, undefined);
+});
+
+const VOICE = { file_id: "voice-id", file_unique_id: "unique", duration: 5, mime_type: "audio/ogg", file_size: 100 };
+const voiceMessage = { text: undefined, voice: VOICE };
+
+test("voice notes show a literal preview and send the full transcript to the session", async () => {
+  const transcript = "Corrija <b>o login</b> & adicione testes.\n" + "More detail. ".repeat(400);
+  const h = harness(undefined, async (voice) => {
+    assert.equal(voice.file_id, VOICE.file_id);
+    return transcript;
+  });
+  await h.bot.init();
+  await h.send("", TOPIC, voiceMessage);
+  const progress = last(h.calls, "sendMessage");
+  assert.equal(progress.payload.text, "🎙 Transcribing…");
+  assert.equal(progress.payload.message_thread_id, TOPIC);
+  assert.equal(progress.payload.reply_parameters.message_id, 1);
+  const preview = last(h.calls, "editMessageText");
+  assert.equal(preview.payload.message_id, 100 + h.calls.indexOf(progress) + 1);
+  assert.ok(preview.payload.text.length < 4096);
+  assert.match(preview.payload.text, /<b>o login<\/b> &/);
+  assert.equal(preview.payload.parse_mode, undefined, "transcribed markup is literal text");
+  assert.deepEqual(h.started, [transcript], "the preview truncation never truncates the prompt");
+});
+
+test("voice in General opens the host/agent picker and starts a remote Codex session with the transcript", async () => {
+  const h = harness(REMOTE_HOSTS(), async () => "Fix the player on Debian");
+  await h.bot.init();
+  await h.send("", null, voiceMessage);
+  assert.deepEqual(h.started, []);
+  const menu = last(h.calls, "sendMessage");
+  assert.match(menu.payload.text, /Fix the player on Debian/);
+  assert.equal(menu.payload.reply_parameters.message_id, 1);
+  const menuId = 100 + h.calls.indexOf(menu) + 1;
+  await h.tap("new:h:debian", menuId);
+  await h.tap("new:a:codex", menuId);
+  assert.equal(h.store.get(TOPIC + 1)!.host, "debian");
+  assert.equal(h.store.get(TOPIC + 1)!.agent, "codex");
+  assert.deepEqual(h.started, ["Fix the player on Debian"]);
+});
+
+test("/new as a reply to voice transcribes it; an explicit task skips transcription", async () => {
+  let transcribed = 0;
+  const h = harness(undefined, async () => { transcribed++; return "A spoken task"; });
+  await h.bot.init();
+  const replied = { message_id: 55, date: 0, chat: CHAT, from: USER, voice: VOICE };
+  await h.send("/new", null, { reply_to_message: replied });
+  const menu = last(h.calls, "sendMessage");
+  assert.match(menu.payload.text, /A spoken task/);
+  assert.equal(menu.payload.reply_parameters.message_id, 55);
+  await h.tap("new:a:claude", 100 + h.calls.indexOf(menu) + 1);
+  assert.deepEqual(h.started, ["A spoken task"]);
+  await h.send("/new typed task", null, { reply_to_message: replied });
+  assert.equal(transcribed, 1);
+  assert.match(last(h.calls, "sendMessage").payload.text, /typed task/);
+});
+
+test("failed transcription reports the error without sending a prompt or opening a picker", async () => {
+  const h = harness(undefined, async () => { throw new VoiceError("No speech was recognized."); });
+  await h.bot.init();
+  await h.send("", TOPIC, voiceMessage);
+  assert.equal(last(h.calls, "editMessageText").payload.text, "❌ No speech was recognized.");
+  await h.send("", null, voiceMessage);
+  assert.equal(h.calls.filter((c) => c.method === "sendMessage").length, 2, "only the two progress messages");
+  await h.send("/new", null, { reply_to_message: { message_id: 55, date: 0, chat: CHAT, voice: VOICE } });
+  assert.equal(h.calls.filter((c) => c.method === "sendMessage").length, 3, "no empty /new wizard on failure");
+  assert.deepEqual(h.started, []);
+});
+
+test("missing local model explains setup while text prompts still work", async () => {
+  const h = harness(undefined, async () => { throw new VoiceError("The local Whisper model is missing. Set WHISPER_MODEL_PATH on the gateway."); });
+  await h.bot.init();
+  await h.send("", TOPIC, voiceMessage);
+  assert.match(last(h.calls, "editMessageText").payload.text, /WHISPER_MODEL_PATH/);
+  assert.deepEqual(h.started, []);
+  await h.send("typed prompt");
+  assert.deepEqual(h.started, ["typed prompt"]);
+});
+
+test("unauthorized users, wrong chats, and setup mode never transcribe voice", async () => {
+  let transcribed = 0;
+  const h = harness(undefined, async () => { transcribed++; return "task"; });
+  await h.bot.init();
+  await h.send("", TOPIC, { ...voiceMessage, from: { ...USER, id: 999 } });
+  await h.send("", TOPIC, { ...voiceMessage, chat: { ...CHAT, id: -1009999 } });
+  h.cfg.setupMode = true;
+  await h.send("", TOPIC, voiceMessage);
+  assert.equal(transcribed, 0);
+  assert.deepEqual(h.calls, []);
+  assert.deepEqual(h.started, []);
+});
+
+test("ended and unlinked topics reject voice before transcription", async () => {
+  let transcribed = 0;
+  const h = harness(undefined, async () => { transcribed++; return "task"; });
+  await h.bot.init();
+  await h.send("", TOPIC + 99, voiceMessage);
+  assert.match(last(h.calls, "sendMessage").payload.text, /isn't linked/);
+  h.store.update(TOPIC, { closed: true });
+  await h.send("", TOPIC, voiceMessage);
+  assert.match(last(h.calls, "sendMessage").payload.text, /has ended/);
+  assert.equal(transcribed, 0);
+  assert.deepEqual(h.started, []);
+});
+
+test("unexpected transcription errors cannot expose tokens in replies", async () => {
+  const h = harness(undefined, async () => { throw new Error("secret token in download URL"); });
+  await h.bot.init();
+  await h.send("", TOPIC, voiceMessage);
+  assert.match(last(h.calls, "editMessageText").payload.text, /Could not transcribe/);
+  assert.doesNotMatch(JSON.stringify(h.calls), /secret token/);
+  assert.deepEqual(h.started, []);
 });

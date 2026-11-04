@@ -20,6 +20,14 @@ export interface Config {
   };
   /** Chat or users not configured yet: the bot only answers /whoami. */
   setupMode: boolean;
+  /** Short background title summaries use the gateway's Claude login. */
+  topicTitleModel: string;
+  /** Whisper.cpp voice transcription, performed locally on the gateway. */
+  transcription: {
+    modelPath: string;
+    executable: string;
+    ffmpegPath: string;
+  };
   /** Where every session starts. The agents can still work anywhere on the host. */
   workdir: Project;
   dataDir: string;
@@ -84,6 +92,10 @@ export const GATEWAY_ENV_KEYS = [
   "TELEGRAM_BOT_TOKEN",
   "TELEGRAM_CHAT_ID",
   "TELEGRAM_ALLOWED_USER_IDS",
+  "TOPIC_TITLE_MODEL",
+  "WHISPER_MODEL_PATH",
+  "WHISPER_PATH",
+  "FFMPEG_PATH",
   "AGENT_CWD",
   "DATA_DIR",
   "HOSTS_FILE",
@@ -125,6 +137,12 @@ function readConfig(): Config {
   return {
     telegram: { token: required("TELEGRAM_BOT_TOKEN"), chatId, allowedUserIds },
     setupMode: chatId === undefined || allowedUserIds.size === 0,
+    topicTitleModel: optional("TOPIC_TITLE_MODEL") ?? "haiku",
+    transcription: {
+      modelPath: path.resolve(expandHome(optional("WHISPER_MODEL_PATH") ?? "~/.cache/manglr/ggml-small.bin")),
+      executable: expandHome(optional("WHISPER_PATH") ?? "whisper-cli"),
+      ffmpegPath: expandHome(optional("FFMPEG_PATH") ?? "ffmpeg"),
+    },
     workdir: loadWorkdir(),
     dataDir: path.resolve(expandHome(optional("DATA_DIR") ?? "data")),
     hosts: loadHosts(path.resolve(expandHome(optional("HOSTS_FILE") ?? "hosts.json"))),

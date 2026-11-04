@@ -3,6 +3,12 @@ import type { AgentEvents, PermissionDecision, PermissionRequest } from "../agen
 import { log } from "../util/log.js";
 import { chunkMarkdown, escapeHtml, markdownToHtml, TELEGRAM_LIMIT } from "./format.js";
 import type { PermissionBroker } from "./permissions.js";
+import type { SessionActivity } from "../store.js";
+
+export interface TopicLifecycle {
+  state(activity: SessionActivity): void;
+  reply(text: string): void;
+}
 
 /** Replies longer than this also arrive as a .md file. */
 const ATTACH_OVER = 12_000;
@@ -20,6 +26,7 @@ const TYPING_EVERY_MS = 4500;
 export class TopicUI implements AgentEvents {
   private sendChain: Promise<unknown> = Promise.resolve();
   private typing?: NodeJS.Timeout;
+  private disposed = false;
   private turn?: {
     startedAt: number;
     lines: string[];
@@ -27,6 +34,7 @@ export class TopicUI implements AgentEvents {
     statusId?: number;
     statusPending?: Promise<void>;
     lastEdit: number;
+    pendingPermissions: number;
     editTimer?: NodeJS.Timeout;
   };
 
@@ -36,14 +44,18 @@ export class TopicUI implements AgentEvents {
     private readonly topicId: number,
     private readonly permissions: PermissionBroker,
     private readonly onSessionId: (id: string) => void,
+    private readonly lifecycle?: TopicLifecycle,
   ) {}
 
   sessionId(id: string): void {
+    if (this.disposed) return;
     this.onSessionId(id);
   }
 
   turnStarted(): void {
-    this.turn = { startedAt: Date.now(), lines: [], steps: 0, lastEdit: 0 };
+    if (this.disposed) return;
+    this.turn = { startedAt: Date.now(), lines: [], steps: 0, lastEdit: 0, pendingPermissions: 0 };
+    this.lifecycle?.state("working");
     this.startTyping();
   }
 
@@ -57,14 +69,18 @@ export class TopicUI implements AgentEvents {
   }
 
   reply(text: string, final: boolean): void {
+    if (this.disposed) return;
+    if (final) this.lifecycle?.reply(text);
     this.enqueue(() => this.sendReply(text, final));
   }
 
   turnEnded(info: { error?: string; interrupted?: boolean; costUsd?: number }): void {
+    if (this.disposed) return;
     this.stopTyping();
     const t = this.turn;
     this.turn = undefined;
     if (!t) return;
+    this.lifecycle?.state(info.error || info.interrupted ? "idle" : "ready");
     clearTimeout(t.editTimer);
     const secs = Math.round((Date.now() - t.startedAt) / 1000);
     const elapsed = secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`;
@@ -87,9 +103,17 @@ export class TopicUI implements AgentEvents {
   }
 
   askPermission(req: PermissionRequest): Promise<PermissionDecision> {
+    if (this.disposed) return Promise.resolve("deny");
+    const turn = this.turn;
+    if (turn) turn.pendingPermissions++;
+    this.lifecycle?.state("idle");
     this.stopTyping(); // waiting on the person, not working
     return this.permissions.request(this.chatId, this.topicId, req).finally(() => {
-      if (this.turn) this.startTyping();
+      if (turn) turn.pendingPermissions--;
+      if (this.turn && this.turn === turn && !turn.pendingPermissions && !this.disposed) {
+        this.lifecycle?.state("working");
+        this.startTyping();
+      }
     });
   }
 
@@ -99,6 +123,7 @@ export class TopicUI implements AgentEvents {
   }
 
   dispose(): void {
+    this.disposed = true;
     this.stopTyping();
     if (this.turn) clearTimeout(this.turn.editTimer);
   }

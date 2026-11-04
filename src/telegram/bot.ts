@@ -1,5 +1,6 @@
 import { hostname } from "node:os";
 import { Bot, InlineKeyboard, type Context } from "grammy";
+import type { Voice } from "grammy/types";
 import { AGENTS, type AgentKind } from "../agents/types.js";
 import type { Config, Project } from "../config.js";
 import type { ModelCatalog } from "../models.js";
@@ -9,6 +10,8 @@ import type { SessionRecord, SessionStore } from "../store.js";
 import { log } from "../util/log.js";
 import { escapeHtml } from "./format.js";
 import type { PermissionBroker } from "./permissions.js";
+import { createVoiceTranscriber, VoiceError, type VoiceTranscriber } from "./voice.js";
+import { ACTIVITY, activityOf, topicName } from "./session-topics.js";
 
 export const COMMANDS = [
   { command: "new", description: "Start an agent session in a new thread" },
@@ -49,6 +52,7 @@ export function registerHandlers(
   permissions: PermissionBroker,
   models: ModelCatalog,
   hosts?: HostDirectory,
+  transcribeVoice: VoiceTranscriber = createVoiceTranscriber(cfg, bot.api),
 ): void {
   const chatId = cfg.telegram.chatId;
   const remoteHosts = hosts?.names() ?? [];
@@ -56,8 +60,6 @@ export function registerHandlers(
   /** The model menu of the host a session runs on. */
   const catalog = (host: string | undefined) => (host && hosts ? hosts.catalog(host) : models);
   const hostLabel = (host: string | undefined) => host ?? localName;
-  const topicName = (agent: AgentKind, title: string, host: string | undefined) =>
-    clip(`${AGENTS[agent].emoji} ${host ? `${host}: ` : ""}${title}`, 128);
   const wizards = new Map<number, Wizard>();
   const claudeBypass = cfg.claude.permissionMode === "bypassPermissions";
   const codexFull = cfg.codex.sandboxMode === "danger-full-access";
@@ -99,6 +101,8 @@ export function registerHandlers(
           : "• /new [task]: pick Claude or Codex; a new thread opens for the session.",
         "• Or just send the task in General (or reply /new to a message): it becomes the new session's first prompt.",
         "• Reply in a thread to talk to its agent. Messages sent while it works are passed along.",
+        "• Voice messages are transcribed by local Whisper on the gateway and become prompts.",
+        "• Topic names summarize the conversation: 💤 idle, ⏳ working, ✅ ready. The pinned card identifies the host and agent.",
         "• Tool permission requests (Claude) show up with Allow / Deny buttons.",
         "• /model switches the model of a thread's session, /effort its reasoning effort.",
         "• /stop stops the current turn, /end ends the session, /status shows details, /list lists sessions.",
@@ -146,7 +150,9 @@ export function registerHandlers(
   bot.command("new", async (ctx) => {
     // `/new` sent as a reply to a message takes that message as the task.
     const replied = ctx.msg.reply_to_message;
-    const quoted = ctx.match.trim() ? undefined : replied?.text?.trim();
+    const quoted = ctx.match.trim() ? undefined : replied?.text?.trim() ||
+      (replied?.voice ? await voicePrompt(ctx, replied.voice, replied.message_id) : undefined);
+    if (!ctx.match.trim() && replied?.voice && !quoted) return;
     const task = ctx.match.trim() || quoted || undefined;
     await openWizard(ctx, task, quoted ? replied!.message_id : undefined);
   });
@@ -157,7 +163,7 @@ export function registerHandlers(
     const lines = open.map((r) => {
       const busy = manager.isBusy(r.topicId) ? " · ⏳ working" : "";
       const where = r.host ? `${escapeHtml(r.host)}:${escapeHtml(r.project)}` : escapeHtml(r.project);
-      return `${AGENTS[r.agent].emoji} <a href="${topicLink(r.topicId)}">${escapeHtml(r.title)}</a> · ${where}${busy}`;
+      return `${ACTIVITY[activityOf(r)].emoji} <a href="${topicLink(r.topicId)}">${escapeHtml(r.title)}</a> · ${AGENTS[r.agent].label} · ${where}${busy}`;
     });
     await ctx.reply(lines.join("\n"), { parse_mode: "HTML", message_thread_id: topicOf(ctx), link_preview_options: { is_disabled: true } });
   });
@@ -187,7 +193,7 @@ export function registerHandlers(
     if (!rec) return void (await ctx.reply("Use /status inside a session thread.", { message_thread_id: topicId }));
     const lines = [
       `${AGENTS[rec.agent].emoji} <b>${AGENTS[rec.agent].label}</b> · ${escapeHtml(rec.project)}`,
-      ...(rec.host || remoteHosts.length ? [`host: ${escapeHtml(hostLabel(rec.host))}`] : []),
+      `host: ${escapeHtml(hostLabel(rec.host))} (${rec.host ? "remote" : "local"})`,
       `folder: <code>${escapeHtml(rec.cwd)}</code>`,
       `session: <code>${escapeHtml(rec.sessionId ?? "not started")}</code>`,
       `model: ${escapeHtml(await catalog(rec.host).label(rec.agent, rec.model))}`,
@@ -195,7 +201,7 @@ export function registerHandlers(
       rec.agent === "claude"
         ? `permissions: ${escapeHtml(cfg.claude.permissionMode)}${claudeBypass ? " (full access, no prompts)" : " (asks here when needed)"}`
         : `sandbox: ${escapeHtml(cfg.codex.sandboxMode)}${codexFull ? " (full access)" : `, network ${cfg.codex.networkAccess ? "on" : "off"}`}`,
-      `state: ${rec.closed ? "ended" : manager.isBusy(rec.topicId) ? "⏳ working" : "idle"}`,
+      `state: ${ACTIVITY[activityOf(rec)].emoji} ${activityOf(rec)}`,
     ];
     await ctx.reply(lines.join("\n"), {
       parse_mode: "HTML",
@@ -383,7 +389,7 @@ export function registerHandlers(
     const title = wizard.task ? clip(firstLine(wizard.task), 60) : `New ${a.label} session`;
     let topicId: number;
     try {
-      topicId = (await bot.api.createForumTopic(chatId!, topicName(agent, title, wizard.host))).message_thread_id;
+      topicId = (await bot.api.createForumTopic(chatId!, topicName(title))).message_thread_id;
     } catch (err) {
       log.error("createForumTopic failed", String(err));
       const rights = /not enough rights/i.test(String(err));
@@ -396,29 +402,13 @@ export function registerHandlers(
       return;
     }
     manager.create(topicId, agent, project, title, !wizard.task, wizard.host);
-    const models = catalog(wizard.host);
     const on = wizard.host ? ` on <b>${escapeHtml(wizard.host)}</b>` : "";
 
     await ctx.editMessageText(`${a.emoji} <b>${a.label}</b>${on} → <a href="${topicLink(topicId)}">${escapeHtml(title)}</a>`, {
       parse_mode: "HTML",
       link_preview_options: { is_disabled: true },
     });
-    const mode =
-      agent === "claude"
-        ? claudeBypass
-          ? "⚠️ full host access, no approval prompts"
-          : `permissions: ${escapeHtml(cfg.claude.permissionMode)}, I'll ask here when a tool needs approval`
-        : codexFull
-          ? "⚠️ full host access, no sandbox"
-          : `sandbox: ${escapeHtml(cfg.codex.sandboxMode)}, no approval prompts`;
-    await bot.api.sendMessage(
-      chatId!,
-      `${a.emoji} <b>${a.label}</b>${on} in <code>${escapeHtml(project.path)}</code>\n` +
-        `🧠 ${escapeHtml(await models.defaultName(agent))} <i>(default, /model to switch)</i>\n` +
-        `⚡ ${escapeHtml(await models.effortLabel(agent, undefined, undefined))} effort <i>(/effort to switch)</i>\n<i>${mode}</i>` +
-        (wizard.task ? "" : "\n\nSend the first message to start."),
-      { message_thread_id: topicId, parse_mode: "HTML" },
-    );
+    await manager.initializeTopic(topicId);
     if (wizard.task) await sendTo(topicId, wizard.task);
   }
 
@@ -447,30 +437,58 @@ export function registerHandlers(
   });
 
   // --- conversation -------------------------------------------------------------------
-  bot.on("message:text", async (ctx) => {
+  async function routePrompt(ctx: Context, text: string): Promise<void> {
     const topicId = topicOf(ctx);
     if (topicId === undefined) {
       // A message in General is a task: ask where and with which agent, then open a thread for it.
-      const text = ctx.msg.text.trim();
-      if (!text || text.startsWith("/")) return void (await ctx.reply("Start a session with /new. Each session gets its own thread."));
-      return openWizard(ctx, text, ctx.msg.message_id);
+      return openWizard(ctx, text.trim(), ctx.msg!.message_id);
     }
     const rec = store.get(topicId);
     if (!rec) return void (await ctx.reply("This thread isn't linked to an agent. Start one with /new.", { message_thread_id: topicId }));
     if (rec.closed) return void (await ctx.reply("This session has ended. Start a new one with /new.", { message_thread_id: topicId }));
 
-    if (rec.autoTitle) {
-      const title = clip(firstLine(ctx.msg.text), 60);
-      store.update(topicId, { title, autoTitle: false });
-      await bot.api
-        .editForumTopic(chatId!, topicId, { name: topicName(rec.agent, title, rec.host) })
-        .catch((err) => log.warn("editForumTopic failed", String(err)));
+    await sendTo(topicId, text);
+  }
+
+  /** Show progress and a literal preview; only the full transcript goes to the agent. */
+  async function voicePrompt(ctx: Context, voice: Voice, messageId: number): Promise<string | undefined> {
+    const progress = await ctx.reply("🎙 Transcribing…", {
+      message_thread_id: topicOf(ctx),
+      reply_parameters: { message_id: messageId, allow_sending_without_reply: true },
+    });
+    let text: string;
+    try {
+      text = await transcribeVoice(voice);
+    } catch (err) {
+      const message = err instanceof VoiceError ? err.message : "Could not transcribe the voice message. Please try again, or send the prompt as text.";
+      log.warn("voice transcription failed:", message);
+      await bot.api.editMessageText(ctx.chat!.id, progress.message_id, `❌ ${message}`);
+      return;
     }
-    await sendTo(topicId, ctx.msg.text);
+    await bot.api.editMessageText(ctx.chat!.id, progress.message_id, `🎙 ${clip(text, 3800)}`);
+    return text;
+  }
+
+  bot.on("message:text", async (ctx) => {
+    if (topicOf(ctx) === undefined && (!ctx.msg.text.trim() || ctx.msg.text.trim().startsWith("/"))) {
+      return void (await ctx.reply("Start a session with /new. Each session gets its own thread."));
+    }
+    await routePrompt(ctx, ctx.msg.text);
   });
 
-  bot.on(["message:photo", "message:document", "message:voice", "message:video", "message:audio"], (ctx) =>
-    ctx.reply("Only text messages are supported for now.", { message_thread_id: topicOf(ctx) }),
+  bot.on("message:voice", async (ctx) => {
+    const topicId = topicOf(ctx);
+    // Reject ended/unlinked threads before downloading audio or running inference.
+    if (topicId !== undefined) {
+      const rec = store.get(topicId);
+      if (!rec || rec.closed) return routePrompt(ctx, "");
+    }
+    const text = await voicePrompt(ctx, ctx.msg.voice, ctx.msg.message_id);
+    if (text) await routePrompt(ctx, text);
+  });
+
+  bot.on(["message:photo", "message:document", "message:video", "message:audio"], (ctx) =>
+    ctx.reply("Send a text or voice message. Other attachments aren't supported yet.", { message_thread_id: topicOf(ctx) }),
   );
 
   bot.catch((err) => log.error(`update ${err.ctx.update.update_id} failed`, err.error));

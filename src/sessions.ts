@@ -7,6 +7,7 @@ import type { HostRegistry } from "./remote/registry.js";
 import type { SessionRecord, SessionStore } from "./store.js";
 import type { PermissionBroker } from "./telegram/permissions.js";
 import { TopicUI } from "./telegram/topic-ui.js";
+import type { SessionTopics } from "./telegram/session-topics.js";
 import { log } from "./util/log.js";
 
 interface Live {
@@ -28,10 +29,19 @@ export class SessionManager {
     private readonly store: SessionStore,
     private readonly permissions: PermissionBroker,
     private readonly hosts?: HostRegistry,
+    private readonly topics?: SessionTopics,
   ) {}
 
   create(topicId: number, agent: AgentKind, project: Project, title: string, autoTitle: boolean, host?: string): SessionRecord {
-    return this.store.upsert({ topicId, agent, host, project: project.name, cwd: project.path, title, autoTitle });
+    return this.store.upsert({ topicId, agent, host, project: project.name, cwd: project.path, title, autoTitle, activity: "idle" });
+  }
+
+  initializeTopic(topicId: number): Promise<void> {
+    return this.topics?.refresh(topicId) ?? Promise.resolve();
+  }
+
+  restoreTopics(): Promise<void> {
+    return this.topics?.restore() ?? Promise.resolve();
   }
 
   isBusy(topicId: number): boolean {
@@ -41,12 +51,18 @@ export class SessionManager {
   send(topicId: number, text: string): void {
     const live = this.ensure(topicId);
     if (!live) throw new Error(`no open session for topic ${topicId}`);
+    this.topics?.userMessage(topicId, text);
     if (live.session.busy) {
       void live.ui.notice(
         live.session.kind === "codex" ? "📥 <i>Queued: Codex will get this when the current turn ends.</i>" : "📥 <i>Sent to Claude mid-turn.</i>",
       );
     }
-    live.session.send(text);
+    try {
+      live.session.send(text);
+    } catch (err) {
+      this.topics?.state(topicId, "idle");
+      throw err;
+    }
     this.store.update(topicId, {}); // bump updatedAt for /list ordering
   }
 
@@ -55,6 +71,7 @@ export class SessionManager {
     const record = this.store.update(topicId, { model });
     if (!record) throw new Error(`no session for topic ${topicId}`);
     await this.live.get(topicId)?.session.setModel(this.effectiveModel(record));
+    await this.topics?.refresh(topicId);
   }
 
   /** Switch a session's reasoning effort; `undefined` goes back to the configured default. */
@@ -62,6 +79,7 @@ export class SessionManager {
     const record = this.store.update(topicId, { effort });
     if (!record) throw new Error(`no session for topic ${topicId}`);
     await this.live.get(topicId)?.session.setEffort(this.effectiveEffort(record));
+    await this.topics?.refresh(topicId);
   }
 
   async stop(topicId: number): Promise<boolean> {
@@ -79,6 +97,8 @@ export class SessionManager {
       await live.session.close();
     }
     this.store.update(topicId, { closed: true });
+    this.topics?.state(topicId, "ended");
+    await this.topics?.refresh(topicId);
   }
 
   async shutdown(): Promise<void> {
@@ -91,6 +111,7 @@ export class SessionManager {
     );
     this.live.clear();
     this.hosts?.shutdown();
+    await this.topics?.shutdown();
   }
 
   private ensure(topicId: number): Live | undefined {
@@ -101,6 +122,10 @@ export class SessionManager {
 
     const ui = new TopicUI(this.api, this.cfg.telegram.chatId!, topicId, this.permissions, (sessionId) => {
       this.store.update(topicId, { sessionId });
+      void this.topics?.refresh(topicId);
+    }, {
+      state: (activity) => this.topics?.state(topicId, activity),
+      reply: (text) => this.topics?.assistantMessage(topicId, text),
     });
     const init = { cwd: record.cwd, resume: record.sessionId, model: this.effectiveModel(record), effort: this.effectiveEffort(record) };
     let session: AgentSession;
