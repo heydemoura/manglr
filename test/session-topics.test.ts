@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { Api } from "grammy";
+import { Api, GrammyError } from "grammy";
 import type { AgentEvents, AgentSession, PermissionDecision } from "../src/agents/types.js";
 import type { Config } from "../src/config.js";
 import type { ModelCatalog } from "../src/models.js";
@@ -44,7 +44,7 @@ function fixture(t: TestContext, summarize: TitleSummarizer = async () => "Login
 }
 
 async function until(predicate: () => boolean): Promise<void> {
-  const deadline = Date.now() + 3000;
+  const deadline = Date.now() + 8000;
   while (!predicate()) {
     if (Date.now() > deadline) assert.fail("timed out waiting for background topic update");
     await delay(5);
@@ -238,4 +238,27 @@ test("session lifecycle updates status for work, replies, approvals, stop, failu
   events!.turnStarted();
   events!.turnEnded({});
   assert.equal(h.store.get(TOPIC)!.activity, "ended", "late SDK events cannot revive a disposed session");
+});
+
+test("a Telegram rate limit retries the topic after the wait instead of dropping it", async (t) => {
+  const { topics, calls, failures, store } = fixture(t);
+  store.upsert({ topicId: 8, agent: "claude", project: "p", cwd: "/tmp/other", title: "Other session" });
+  const tooMany = new GrammyError(
+    "Call to 'editForumTopic' failed! (429: Too Many Requests: retry after 1)",
+    { ok: false, error_code: 429, description: "Too Many Requests: retry after 1", parameters: { retry_after: 0.05 } },
+    "editForumTopic",
+    {},
+  );
+  failures.set("editForumTopic", tooMany);
+  await topics.refresh(TOPIC);
+  // The limit stops this update before the card, and holds back other topics while it lasts.
+  assert.equal(calls.filter((c) => c.method === "sendMessage").length, 0);
+  await topics.refresh(8);
+  assert.equal(calls.filter((c) => c.method === "editForumTopic").length, 1);
+
+  await until(() => calls.filter((c) => c.method === "sendMessage").length === 2);
+  const renamed = calls.filter((c) => c.method === "editForumTopic").map((c) => c.payload.message_thread_id).sort();
+  assert.deepEqual(renamed, [TOPIC, TOPIC, 8]);
+  assert.ok(store.get(TOPIC)!.pinnedMessageId);
+  assert.ok(store.get(8)!.pinnedMessageId);
 });

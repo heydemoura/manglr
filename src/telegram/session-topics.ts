@@ -1,5 +1,5 @@
 import { hostname } from "node:os";
-import { InlineKeyboard, type Api } from "grammy";
+import { GrammyError, InlineKeyboard, type Api } from "grammy";
 import { AGENTS } from "../agents/types.js";
 import type { Config } from "../config.js";
 import type { ModelCatalog } from "../models.js";
@@ -20,6 +20,11 @@ export function activityOf(record: SessionRecord): SessionActivity {
   return record.closed ? "ended" : record.activity ?? "idle";
 }
 
+/** Seconds Telegram asked us to wait, when `err` is a rate limit (429). */
+function retryAfter(err: unknown): number | undefined {
+  return err instanceof GrammyError && err.error_code === 429 ? (err.parameters.retry_after ?? 5) : undefined;
+}
+
 export function topicName(title: string, activity: SessionActivity = "idle"): string {
   return `${ACTIVITY[activity].emoji} ${title}`.slice(0, 128);
 }
@@ -32,6 +37,10 @@ export class SessionTopics {
   private readonly timers = new Map<number, NodeJS.Timeout>();
   private readonly summaries = new Map<number, AbortController>();
   private summaryChain: Promise<void> = Promise.resolve();
+  /** Topics waiting out a Telegram rate limit before their next update. */
+  private readonly retries = new Map<number, NodeJS.Timeout>();
+  /** Telegram rate-limited us until then: updates wait instead of piling more 429s. */
+  private pausedUntil = 0;
   private disposed = false;
 
   constructor(
@@ -68,11 +77,37 @@ export class SessionTopics {
   /** Serializing edits prevents a slow old update from overwriting a newer state. */
   refresh(topicId: number): Promise<void> {
     if (this.disposed) return Promise.resolve();
+    if (Date.now() < this.pausedUntil) {
+      this.retryLater(topicId);
+      return Promise.resolve();
+    }
     const next = (this.updates.get(topicId) ?? Promise.resolve()).then(() => this.render(topicId))
-      .catch(() => log.warn(`topic ${topicId}: could not update its title or session card`));
+      .catch((err) => {
+        const wait = retryAfter(err);
+        if (wait === undefined) return log.warn(`topic ${topicId}: could not update its title or session card: ${String(err)}`);
+        this.pausedUntil = Math.max(this.pausedUntil, Date.now() + wait * 1000);
+        log.warn(`topic ${topicId}: Telegram rate limit; updating its title and session card in ~${Math.ceil(wait)}s`);
+        this.retryLater(topicId);
+      });
     this.updates.set(topicId, next);
     void next.then(() => { if (this.updates.get(topicId) === next) this.updates.delete(topicId); });
     return next;
+  }
+
+  /**
+   * Update the topic once the rate limit has passed. Startup restores every open
+   * topic at once (rename + card + pin each), which can exceed Telegram's
+   * per-group limits; retries are staggered so they don't trip it again together.
+   */
+  private retryLater(topicId: number): void {
+    if (this.disposed || this.retries.has(topicId)) return;
+    const delay = Math.max(0, this.pausedUntil - Date.now()) + 1000 + this.retries.size * 3000;
+    const timer = setTimeout(() => {
+      this.retries.delete(topicId);
+      void this.refresh(topicId);
+    }, delay);
+    timer.unref();
+    this.retries.set(topicId, timer);
   }
 
   /** Recover existing topics without claiming an old turn is still running. */
@@ -90,6 +125,8 @@ export class SessionTopics {
 
   async shutdown(): Promise<void> {
     this.disposed = true;
+    for (const timer of this.retries.values()) clearTimeout(timer);
+    this.retries.clear();
     for (const id of this.timers.keys()) this.cancelSummary(id);
     for (const controller of this.summaries.values()) controller.abort();
     await Promise.all(this.updates.values());
@@ -154,8 +191,9 @@ export class SessionTopics {
       try {
         await this.api.editForumTopic(this.cfg.telegram.chatId!, topicId, { name });
         this.names.set(topicId, name);
-      } catch {
-        log.warn(`topic ${topicId}: could not rename the topic`);
+      } catch (err) {
+        if (retryAfter(err) !== undefined) throw err; // retried with the card after the limit
+        log.warn(`topic ${topicId}: could not rename the topic: ${String(err)}`);
       }
     }
     const host = record.host ?? (hostname().split(".")[0] || "local");
@@ -197,8 +235,9 @@ export class SessionTopics {
       try {
         await this.api.pinChatMessage(this.cfg.telegram.chatId!, messageId, { disable_notification: true });
         this.store.update(topicId, { cardPinned: true });
-      } catch {
-        log.warn(`topic ${topicId}: could not pin the session card; the bot needs Pin Messages permission`);
+      } catch (err) {
+        if (retryAfter(err) !== undefined) throw err;
+        log.warn(`topic ${topicId}: could not pin the session card (the bot needs Pin Messages permission): ${String(err)}`);
       }
     }
   }
