@@ -142,6 +142,8 @@ export class ClaudeSession implements AgentSession {
       for await (const msg of q) this.handle(msg);
       this.endTurn({ error: this.closed ? undefined : "Claude Code exited" });
     } catch (err) {
+      // close() ends the Claude Code process (exit 143 on SIGTERM): not a failure.
+      if (this.closed) return this.endTurn({});
       log.error("claude query failed", err);
       this.endTurn({ error: err instanceof Error ? err.message : String(err) });
     } finally {
