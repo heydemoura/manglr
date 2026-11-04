@@ -1,5 +1,6 @@
 import { hostname } from "node:os";
 import { Bot, InlineKeyboard, type Context } from "grammy";
+import type { Voice } from "grammy/types";
 import { AGENTS, type AgentKind } from "../agents/types.js";
 import type { Config, Project } from "../config.js";
 import type { ModelCatalog } from "../models.js";
@@ -9,6 +10,7 @@ import type { SessionRecord, SessionStore } from "../store.js";
 import { log } from "../util/log.js";
 import { escapeHtml } from "./format.js";
 import type { PermissionBroker } from "./permissions.js";
+import { createVoiceTranscriber, VoiceError, type VoiceTranscriber } from "./voice.js";
 
 export const COMMANDS = [
   { command: "new", description: "Start an agent session in a new thread" },
@@ -49,6 +51,7 @@ export function registerHandlers(
   permissions: PermissionBroker,
   models: ModelCatalog,
   hosts?: HostDirectory,
+  transcribeVoice: VoiceTranscriber = createVoiceTranscriber(cfg, bot.api),
 ): void {
   const chatId = cfg.telegram.chatId;
   const remoteHosts = hosts?.names() ?? [];
@@ -99,6 +102,7 @@ export function registerHandlers(
           : "• /new [task]: pick Claude or Codex; a new thread opens for the session.",
         "• Or just send the task in General (or reply /new to a message): it becomes the new session's first prompt.",
         "• Reply in a thread to talk to its agent. Messages sent while it works are passed along.",
+        "• Voice messages are transcribed by local Whisper on the gateway and become prompts.",
         "• Tool permission requests (Claude) show up with Allow / Deny buttons.",
         "• /model switches the model of a thread's session, /effort its reasoning effort.",
         "• /stop stops the current turn, /end ends the session, /status shows details, /list lists sessions.",
@@ -146,7 +150,9 @@ export function registerHandlers(
   bot.command("new", async (ctx) => {
     // `/new` sent as a reply to a message takes that message as the task.
     const replied = ctx.msg.reply_to_message;
-    const quoted = ctx.match.trim() ? undefined : replied?.text?.trim();
+    const quoted = ctx.match.trim() ? undefined : replied?.text?.trim() ||
+      (replied?.voice ? await voicePrompt(ctx, replied.voice, replied.message_id) : undefined);
+    if (!ctx.match.trim() && replied?.voice && !quoted) return;
     const task = ctx.match.trim() || quoted || undefined;
     await openWizard(ctx, task, quoted ? replied!.message_id : undefined);
   });
@@ -447,30 +453,65 @@ export function registerHandlers(
   });
 
   // --- conversation -------------------------------------------------------------------
-  bot.on("message:text", async (ctx) => {
+  async function routePrompt(ctx: Context, text: string): Promise<void> {
     const topicId = topicOf(ctx);
     if (topicId === undefined) {
       // A message in General is a task: ask where and with which agent, then open a thread for it.
-      const text = ctx.msg.text.trim();
-      if (!text || text.startsWith("/")) return void (await ctx.reply("Start a session with /new. Each session gets its own thread."));
-      return openWizard(ctx, text, ctx.msg.message_id);
+      return openWizard(ctx, text.trim(), ctx.msg!.message_id);
     }
     const rec = store.get(topicId);
     if (!rec) return void (await ctx.reply("This thread isn't linked to an agent. Start one with /new.", { message_thread_id: topicId }));
     if (rec.closed) return void (await ctx.reply("This session has ended. Start a new one with /new.", { message_thread_id: topicId }));
 
     if (rec.autoTitle) {
-      const title = clip(firstLine(ctx.msg.text), 60);
+      const title = clip(firstLine(text), 60);
       store.update(topicId, { title, autoTitle: false });
       await bot.api
         .editForumTopic(chatId!, topicId, { name: topicName(rec.agent, title, rec.host) })
         .catch((err) => log.warn("editForumTopic failed", String(err)));
     }
-    await sendTo(topicId, ctx.msg.text);
+    await sendTo(topicId, text);
+  }
+
+  /** Show progress and a literal preview; only the full transcript goes to the agent. */
+  async function voicePrompt(ctx: Context, voice: Voice, messageId: number): Promise<string | undefined> {
+    const progress = await ctx.reply("🎙 Transcribing…", {
+      message_thread_id: topicOf(ctx),
+      reply_parameters: { message_id: messageId, allow_sending_without_reply: true },
+    });
+    let text: string;
+    try {
+      text = await transcribeVoice(voice);
+    } catch (err) {
+      const message = err instanceof VoiceError ? err.message : "Could not transcribe the voice message. Please try again, or send the prompt as text.";
+      log.warn("voice transcription failed:", message);
+      await bot.api.editMessageText(ctx.chat!.id, progress.message_id, `❌ ${message}`);
+      return;
+    }
+    await bot.api.editMessageText(ctx.chat!.id, progress.message_id, `🎙 ${clip(text, 3800)}`);
+    return text;
+  }
+
+  bot.on("message:text", async (ctx) => {
+    if (topicOf(ctx) === undefined && (!ctx.msg.text.trim() || ctx.msg.text.trim().startsWith("/"))) {
+      return void (await ctx.reply("Start a session with /new. Each session gets its own thread."));
+    }
+    await routePrompt(ctx, ctx.msg.text);
   });
 
-  bot.on(["message:photo", "message:document", "message:voice", "message:video", "message:audio"], (ctx) =>
-    ctx.reply("Only text messages are supported for now.", { message_thread_id: topicOf(ctx) }),
+  bot.on("message:voice", async (ctx) => {
+    const topicId = topicOf(ctx);
+    // Reject ended/unlinked threads before downloading audio or running inference.
+    if (topicId !== undefined) {
+      const rec = store.get(topicId);
+      if (!rec || rec.closed) return routePrompt(ctx, "");
+    }
+    const text = await voicePrompt(ctx, ctx.msg.voice, ctx.msg.message_id);
+    if (text) await routePrompt(ctx, text);
+  });
+
+  bot.on(["message:photo", "message:document", "message:video", "message:audio"], (ctx) =>
+    ctx.reply("Send a text or voice message. Other attachments aren't supported yet.", { message_thread_id: topicOf(ctx) }),
   );
 
   bot.catch((err) => log.error(`update ${err.ctx.update.update_id} failed`, err.error));
