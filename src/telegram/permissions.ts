@@ -54,28 +54,35 @@ export class PermissionBroker {
     });
   }
 
-  /** Handle a button tap. Returns false when the request is gone (already answered or stale). */
-  async answer(data: string): Promise<boolean> {
+  /**
+   * Handle a button tap. Returns false when the request is gone (already
+   * answered or stale). Synchronous on purpose: Telegram only accepts the tap's
+   * answerCallbackQuery for a short while, so the caller answers it right away
+   * and the "✅ Allowed" edit of the message (which can wait out a rate limit)
+   * happens in the background.
+   */
+  answer(data: string): boolean {
     const [, id, decision] = data.split(":");
     if (!id || !(decision === "allow" || decision === "always" || decision === "deny")) return false;
-    return this.settle(id, decision);
+    return this.settle(id, decision) !== undefined;
   }
 
-  /** Deny everything still waiting (used on shutdown). */
+  /** Deny everything still waiting (used on shutdown), and wait for the messages to say so. */
   async denyAll(note: string): Promise<void> {
     await Promise.all([...this.pending.keys()].map((id) => this.settle(id, "deny", note)));
   }
 
-  private async settle(id: string, decision: PermissionDecision, note?: string): Promise<boolean> {
+  /** Resolves the request now; returns the edit of its message, or undefined when it's gone. */
+  private settle(id: string, decision: PermissionDecision, note?: string): Promise<void> | undefined {
     const p = this.pending.get(id);
-    if (!p) return false;
+    if (!p) return undefined;
     this.pending.delete(id);
     p.resolve(decision);
-    try {
-      await this.api.editMessageText(p.chatId, p.messageId, `${p.body}\n\n${note ?? LABEL[decision]}`, { parse_mode: "HTML" });
-    } catch (err) {
-      log.debug("could not edit permission message", err);
-    }
-    return true;
+    return this.api
+      .editMessageText(p.chatId, p.messageId, `${p.body}\n\n${note ?? LABEL[decision]}`, { parse_mode: "HTML" })
+      .then(
+        () => undefined,
+        (err) => log.debug("could not edit permission message", err),
+      );
   }
 }

@@ -427,7 +427,7 @@ export function registerHandlers(
 
   // --- buttons from running sessions ---------------------------------------------------
   bot.callbackQuery(/^perm:/, async (ctx) => {
-    const ok = await permissions.answer(ctx.callbackQuery.data);
+    const ok = permissions.answer(ctx.callbackQuery.data); // settles now; the message edit follows
     await ctx.answerCallbackQuery(ok ? undefined : { text: "This request is no longer pending." });
   });
 
